@@ -860,11 +860,11 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
         TOKEN_ELEVATION elTok;
         DWORD cbSize = sizeof(TOKEN_ELEVATION);
         GetTokenInformation(tok, TokenElevation, &elTok, sizeof(elTok), &cbSize);
-        bool elevated = elTok.TokenIsElevated;
+        // bool elevated = elTok.TokenIsElevated;
         CloseHandle(tok);
 
-        if (elevated && !appData->_Elevated)
-            return true;
+        // if (elevated && !appData->_Elevated)
+        //    return true;
 
         group = &winAppGroupArr->_Data[winAppGroupArr->_Size++];
         strcpy(group->_ModuleFileName, moduleFileName);
