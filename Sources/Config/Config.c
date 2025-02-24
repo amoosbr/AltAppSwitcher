@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <debugapi.h>
 #include "Utils/Error.h"
+#include "Utils/File.h"
 #include "WinKeyCodes.h"
 
 const EnumString keyES[14] = {
@@ -115,7 +116,8 @@ static bool TryGetEnum(const StrPair* keyValues, const char* token,
 
 void LoadConfig(Config* config)
 {
-    const char* configFile = "AltAppSwitcherConfig.txt";
+    char configFile[MAX_PATH] = {};
+    ConfigPath(configFile);
     FILE* file = fopen(configFile ,"rb");
     if (file == NULL)
     {
@@ -201,7 +203,8 @@ static void WriteFloat(FILE* file, const char* entry, float value)
 
 void WriteConfig(const Config* config)
 {
-    const char* configFile = "AltAppSwitcherConfig.txt";
+    char configFile[MAX_PATH] = {};
+    ConfigPath(configFile);
     FILE* file = fopen(configFile ,"w");
 
 #define WRITE_ENUM(ENTRY, VALUE, ENUM_STRING)\
