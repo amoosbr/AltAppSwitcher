@@ -150,6 +150,7 @@ static DWORD _MainThread;
 #define MSG_DEINIT_WIN (WM_USER + 7)
 #define MSG_DEINIT_APP (WM_USER + 8)
 #define MSG_CANCEL_APP (WM_USER + 9)
+#define MSG_RESTORE_KEY (WM_USER + 13) // see Utils/MessageDef.h
 
 static void InitGraphicsResources(SGraphicsResources* pRes, const Config* config)
 {
@@ -1131,8 +1132,24 @@ static void ApplySwitchApp(const SWinGroup* winGroup)
         const HWND win = winGroup->_Windows[i];
         if (!IsWindow(win))
             continue;
-        RestoreWin(win);
         UIASetFocus(win, UIA);
+
+        // This seems more consistent than SetFocus
+        // Check if this works with focus when closing multiple win
+        /*
+        HWND hCurWnd = GetForegroundWindow();
+        DWORD dwMyID = GetCurrentThreadId();
+        DWORD dwCurID = GetWindowThreadProcessId(hCurWnd, NULL);
+        AttachThreadInput(dwCurID, dwMyID, TRUE);
+
+        SetWindowPos(win, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
+        SetWindowPos(win, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+
+        BringWindowToTop(win);
+        SetForegroundWindow(win);
+        SetActiveWindow(win);
+
+        AttachThreadInput(dwCurID, dwMyID, FALSE);*/
     }
     IUIAutomation_Release(UIA);
     CoUninitialize();
@@ -1196,10 +1213,21 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
         if (isWinSwitch)
             keyState._SwitchWinDown = !releasing;
         if (isInvert)
+        {
             keyState._InvertKeyDown = !releasing;
+        }
         if (isEscape)
             keyState._EscapeDown = !releasing;
     }
+
+    if (keyState._SwitchWinDown == prevKeyState._SwitchWinDown &&
+        keyState._InvertKeyDown == prevKeyState._InvertKeyDown &&
+        keyState._HoldWinDown == prevKeyState._HoldWinDown &&
+        keyState._HoldAppDown == prevKeyState._HoldAppDown &&
+        keyState._SwitchAppDown == prevKeyState._SwitchAppDown &&
+        keyState._EscapeDown == prevKeyState._EscapeDown &&
+        keyState._PrevAppDown == prevKeyState._PrevAppDown)
+        return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     // Update target app state
     bool bypassMsg = false;
@@ -1249,10 +1277,11 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
             PostThreadMessage(_MainThread, MSG_CANCEL_APP, 0, 0);
         }
 
+
         if (mode == ModeNone && switchApp)
             mode = ModeApp;
         else if (mode == ModeNone && switchWin)
-            mode = ModeWin;
+            mode = ModeWin; 
 
         if (mode == ModeApp && prevMode != ModeApp)
         {
@@ -1275,7 +1304,7 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
             PostThreadMessage(_MainThread, keyState._InvertKeyDown ? MSG_PREV_WIN : MSG_NEXT_WIN, 0, 0);
         }
 
-        bypassMsg = 
+        bypassMsg =
             ((mode != ModeNone) || isApplying) &&
             (isWinSwitch || isAppSwitch || isWinHold || isAppHold || isInvert || isPrevApp);
     }
@@ -1285,34 +1314,7 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
         // https://stackoverflow.com/questions/2914989/how-can-i-deal-with-depressed-windows-logo-key-when-using-sendinput
         if (releasing && (isWinHold || isAppHold || isInvert))
         {
-            // Sending 3 inputs in one command do not seem to garantee order, thus the 3 commands
-            // Not sure if the sleep is necessary.
-            {
-                INPUT input = {};
-                input.type = INPUT_KEYBOARD;
-                input.ki.wVk = VK_RCONTROL;
-                input.ki.dwFlags = 0;
-                const UINT uSent = SendInput(1, &input, sizeof(INPUT));
-                ASSERT(uSent == 1);
-            }
-            Sleep(1);
-            {
-                INPUT input = {};
-                input.type = INPUT_KEYBOARD;
-                input.ki.wVk = kbStrut.vkCode;
-                input.ki.dwFlags = KEYEVENTF_KEYUP;
-                const UINT uSent = SendInput(1, &input, sizeof(INPUT));
-                ASSERT(uSent == 1);
-            }
-            Sleep(1);
-            {
-                INPUT input = {};
-                input.type = INPUT_KEYBOARD;
-                input.ki.wVk = VK_RCONTROL;
-                input.ki.dwFlags = KEYEVENTF_KEYUP;
-                const UINT uSent = SendInput(1, &input, sizeof(INPUT));
-                ASSERT(uSent == 1);
-            }
+            PostThreadMessage(_MainThread, MSG_RESTORE_KEY, kbStrut.vkCode, 0);
         }
         return 1;
     }
@@ -1803,6 +1805,24 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
         case MSG_CLOSE_AAS:
         {
             closeAAS = true;
+            break;
+        }
+        case MSG_RESTORE_KEY:
+        {
+            WORD keyCode = msg.wParam;
+            INPUT inputs[3] = {};
+            ZeroMemory(inputs, sizeof(inputs));
+            inputs[0].type = INPUT_KEYBOARD;
+            inputs[0].ki.wVk = VK_RCONTROL;
+            inputs[0].ki.dwFlags = 0;
+            inputs[1].type = INPUT_KEYBOARD;
+            inputs[1].ki.wVk = keyCode;
+            inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+            inputs[2].type = INPUT_KEYBOARD;
+            inputs[2].ki.wVk = VK_RCONTROL;
+            inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+            const UINT uSent = SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+            ASSERT(uSent == 3);
             break;
         }
         }
