@@ -58,13 +58,9 @@ typedef struct SWinGroupArr
 
 typedef struct KeyState
 {
-    bool _SwitchWinDown;
     bool _InvertKeyDown;
     bool _HoldWinDown;
     bool _HoldAppDown;
-    bool _SwitchAppDown;
-    bool _EscapeDown;
-    bool _PrevAppDown;
 } KeyState;
 
 typedef struct SGraphicsResources
@@ -151,6 +147,26 @@ static DWORD _MainThread;
 #define MSG_DEINIT_APP (WM_USER + 8)
 #define MSG_CANCEL_APP (WM_USER + 9)
 #define MSG_RESTORE_KEY (WM_USER + 13) // see Utils/MessageDef.h
+
+static void RestoreKey(WORD keyCode)
+{
+    INPUT inputs[4] = {};
+    ZeroMemory(inputs, sizeof(inputs));
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wVk = VK_RCONTROL;
+    inputs[0].ki.dwFlags = 0;
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wVk = _KeyConfig->_Invert;
+    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[2].type = INPUT_KEYBOARD;
+    inputs[2].ki.wVk = keyCode;
+    inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    inputs[3].type = INPUT_KEYBOARD;
+    inputs[3].ki.wVk = VK_RCONTROL;
+    inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    const UINT uSent = SendInput(ARRAYSIZE(inputs), inputs, sizeof(INPUT));
+    ASSERT(uSent == 4);
+}
 
 static void InitGraphicsResources(SGraphicsResources* pRes, const Config* config)
 {
@@ -402,7 +418,10 @@ static bool IsAltTabWindow(HWND hwnd)
     // Start at the root owner
     const HWND hwndRoot = GetAncestor(hwnd, GA_ROOTOWNER);
     // See if we are the last active visible popup
-    if (GetLastActivePopup(hwndRoot) != hwnd)
+    // Useless and might be null ?
+    // if (GetLastActivePopup(hwndRoot) != hwnd)
+    //     return false;
+    if (hwndRoot != hwnd)
         return false;
     if (!IsWindowVisible(hwnd))
         return false;
@@ -420,28 +439,12 @@ static bool IsAltTabWindow(HWND hwnd)
         return false;
     WINDOWINFO wi;
     GetWindowInfo(hwnd, &wi);
+    //Chrome has sometime WS_EX_TOOLWINDOW while beeing an alttabable window
     if ((wi.dwExStyle & WS_EX_TOOLWINDOW) != 0)
-        return false;
+         return false;
     if ((wi.dwExStyle & WS_EX_TOPMOST) != 0)
         return false;
     return true;
-}
-
-void ErrorDescription(HRESULT hr) 
-{
-     if(FACILITY_WINDOWS == HRESULT_FACILITY(hr)) 
-         hr = HRESULT_CODE(hr); 
-     TCHAR* szErrMsg; 
-
-     if(FormatMessage( 
-       FORMAT_MESSAGE_ALLOCATE_BUFFER|FORMAT_MESSAGE_FROM_SYSTEM, 
-       NULL, hr, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), 
-       (LPTSTR)&szErrMsg, 0, NULL) != 0) 
-     { 
-         printf(TEXT("%s"), szErrMsg); 
-         LocalFree(szErrMsg); 
-     } else 
-         printf( TEXT("[Could not find a description for error # %#x.]\n"), (int)hr); 
 }
 
 static void LoadIndirectString(const wchar_t* packagePath, const wchar_t* packageName, const wchar_t* resource, wchar_t* output)
@@ -775,9 +778,9 @@ static GpBitmap* GetIconFromExe(const char* exePath)
         UnlockResource(hGlobal);
         FreeResource(iconGrp);
     }
-
     // Loads a bitmap from icon resource (bitmap must be freed later)
     HBITMAP hbm = NULL;
+    HBITMAP hbmMask = NULL;
     {
         HRSRC iconResInfo = FindResource(module, MAKEINTRESOURCE(iconResID), RT_ICON);
         HGLOBAL iconRes = LoadResource(module, iconResInfo);
@@ -788,7 +791,7 @@ static GpBitmap* GetIconFromExe(const char* exePath)
         ICONINFO ii;
         GetIconInfo(icon, &ii);
         hbm = ii.hbmColor;
-        DeleteObject(ii.hbmMask);
+        hbmMask= ii.hbmMask;
         DestroyIcon(icon);
     }
 
@@ -799,21 +802,46 @@ static GpBitmap* GetIconFromExe(const char* exePath)
     // Creates a gdi bitmap from the win base api bitmap
     GpBitmap* out;
     {
-        BITMAP bm;
-        MEM_INIT(bm);
+        BITMAP bm = {};
         GetObject(hbm, sizeof(BITMAP), &bm);
         const uint32_t iconSize = bm.bmWidth;
         GdipCreateBitmapFromScan0(iconSize, iconSize, 4 * iconSize, PixelFormat32bppARGB, NULL, &out);
         GpRect r = { 0, 0, iconSize, iconSize };
-        BitmapData dstData;
-        MEM_INIT(dstData);
+        BitmapData dstData = {};
         GdipBitmapLockBits(out, &r, 0, PixelFormat32bppARGB, &dstData);
         GetBitmapBits(hbm, sizeof(uint32_t) * iconSize * iconSize, dstData.Scan0);
+        // Check if color has non zero alpha (is there an alternative)
+        unsigned int* ptr = (unsigned int*)dstData.Scan0;
+        bool noAlpha = true;
+        for (int i = 0; i < iconSize * iconSize; i++)
+        {
+            if (ptr[i] & 0xFF000000)
+            {
+                noAlpha = false;
+                break;
+            }
+        }
+        // If no alpha, init
+        if (noAlpha && hbmMask != NULL && iconSize <= 256)
+        {
+            BITMAP bitmapMask = {};
+            GetObject(hbmMask, sizeof(bitmapMask), (LPVOID)&bitmapMask);
+            unsigned int maskByteSize = bitmapMask.bmWidthBytes * bitmapMask.bmHeight;
+            static char maskData[256 * 256 * 1 / 8];
+            memset(maskData, 0, maskByteSize);
+            GetBitmapBits(hbmMask, maskByteSize, maskData);
+            for (int i = 0; i < iconSize * iconSize; i++)
+            {
+                unsigned int aFromMask = (0x1 & (maskData[i / 8] >> (7 - i % 8))) ? 0 : 0xFF000000;
+                ptr[i] = ptr[i] | aFromMask;
+            }
+        }
         GdipBitmapUnlockBits(out, &dstData);
     }
 
     // Bitmap not needed anymore
     DeleteObject(hbm);
+    DeleteObject(hbmMask);
     hbm = NULL;
 
     return out;
@@ -1101,7 +1129,10 @@ static void RestoreWin(HWND win)
     GetWindowPlacement(win, &placement);
     placement.length = sizeof(WINDOWPLACEMENT);
     if (placement.showCmd == SW_SHOWMINIMIZED)
-        ShowWindowAsync(win, SW_RESTORE);
+    {
+        ShowWindow(win, SW_RESTORE);
+        SetWindowPos(win, HWND_TOP, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOOWNERZORDER);
+    }
 }
 
 static void UIASetFocus(HWND win, IUIAutomation* UIA)
@@ -1116,43 +1147,74 @@ static void UIASetFocus(HWND win, IUIAutomation* UIA)
 
 static void ApplySwitchApp(const SWinGroup* winGroup)
 {
-    for (int i = ((int)winGroup->_WindowCount) - 1; i >= 0 ; i--)
-        RestoreWin(winGroup->_Windows[i]);
+    //CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    //IUIAutomation* UIA = NULL;
+    //{
+    //    DWORD res = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&UIA);
+    //    ASSERT(SUCCEEDED(res))
+    //}
 
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    IUIAutomation* UIA = NULL;
-    {
-        DWORD res = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&UIA);
-        ASSERT(SUCCEEDED(res))
-    }
+    HDWP dwp = BeginDeferWindowPos(winGroup->_WindowCount);
     // Set focus for all win, not only the last one. This way when the active window is closed,
     // the second to last window of the group becomes the active one.
-    for (int i = ((int)winGroup->_WindowCount) - 1; i >= 0 ; i--)
+    HWND fgWin = GetForegroundWindow();
+    DWORD curThread = GetCurrentThreadId();
+    DWORD fgWinThread = GetWindowThreadProcessId(fgWin, NULL);
+    AttachThreadInput(fgWinThread, curThread, TRUE);
+    int winCount = (int)winGroup->_WindowCount;
+
+    for (int i = winCount - 1; i >= 0 ; i--)
+    {
+        const HWND win = winGroup->_Windows[Modulo(i +1, winCount)];
+        RestoreWin(win);
+    }
+
+    HWND prev = HWND_TOP;//GetTopWindow(NULL);
+    for (int i = winCount - 1; i >= 0 ; i--)
+    {
+        const HWND win = winGroup->_Windows[Modulo(i +1, winCount)];
+        if (!IsWindow(win))
+            continue;
+        //UIASetFocus(win, UIA);
+
+        // This seems more consistent than SetFocus
+        // Check if this works with focus when closing multiple win
+        DWORD targetWinThread = GetWindowThreadProcessId(win, NULL);
+        AttachThreadInput(targetWinThread, curThread, TRUE);
+
+        dwp = DeferWindowPos(dwp, win, prev, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOOWNERZORDER);
+        //SetWindowPos(win, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
+        prev = win;
+        //BringWindowToTop(win);
+        //SetForegroundWindow(win);
+        //SetActiveWindow(win);
+    }
+
+    EndDeferWindowPos(dwp);
+    //dwp = BeginDeferWindowPos(winGroup->_WindowCount);
+//
+    //for (int i = winCount - 1; i >= 0 ; i--)
+    //{
+    //    const HWND win = winGroup->_Windows[i];
+    //    if (!IsWindow(win))
+    //        continue;
+    //    dwp = DeferWindowPos(dwp, win, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
+    //}
+//
+    //EndDeferWindowPos(dwp);
+//
+    AttachThreadInput(fgWinThread, curThread, FALSE);
+    for (int i = winCount - 1; i >= 0 ; i--)
     {
         const HWND win = winGroup->_Windows[i];
         if (!IsWindow(win))
             continue;
-        UIASetFocus(win, UIA);
-
-        // This seems more consistent than SetFocus
-        // Check if this works with focus when closing multiple win
-        /*
-        HWND hCurWnd = GetForegroundWindow();
-        DWORD dwMyID = GetCurrentThreadId();
-        DWORD dwCurID = GetWindowThreadProcessId(hCurWnd, NULL);
-        AttachThreadInput(dwCurID, dwMyID, TRUE);
-
-        SetWindowPos(win, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
-        SetWindowPos(win, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOSIZE | SWP_NOMOVE);
-
-        BringWindowToTop(win);
-        SetForegroundWindow(win);
-        SetActiveWindow(win);
-
-        AttachThreadInput(dwCurID, dwMyID, FALSE);*/
+        DWORD targetWinThread = GetWindowThreadProcessId(win, NULL);
+        AttachThreadInput(targetWinThread, curThread, FALSE);
     }
-    IUIAutomation_Release(UIA);
-    CoUninitialize();
+
+    //IUIAutomation_Release(UIA);
+    //CoUninitialize();
 }
 
 static void ApplySwitchWin(HWND win)
@@ -1193,52 +1255,33 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (!isWatchedKey)
         return CallNextHookEx(NULL, nCode, wParam, lParam);
 
-    static KeyState keyState =  { false, false, false, false, false, false, false };
+    static KeyState keyState =  { false, false, false };
     static Mode mode = ModeNone;
 
     const KeyState prevKeyState = keyState;
 
-    const bool releasing = kbStrut.flags & LLKHF_UP;
+    const bool rel = kbStrut.flags & LLKHF_UP;
 
     // Update keyState
     {
         if (isAppHold)
-            keyState._HoldAppDown = !releasing;
-        if (isAppSwitch)
-            keyState._SwitchAppDown = !releasing;
-        if (isPrevApp)
-            keyState._PrevAppDown = !releasing;
+            keyState._HoldAppDown = !rel;
         if (isWinHold)
-            keyState._HoldWinDown = !releasing;
-        if (isWinSwitch)
-            keyState._SwitchWinDown = !releasing;
+            keyState._HoldWinDown = !rel;
         if (isInvert)
-        {
-            keyState._InvertKeyDown = !releasing;
-        }
-        if (isEscape)
-            keyState._EscapeDown = !releasing;
+            keyState._InvertKeyDown = !rel;
     }
-
-    if (keyState._SwitchWinDown == prevKeyState._SwitchWinDown &&
-        keyState._InvertKeyDown == prevKeyState._InvertKeyDown &&
-        keyState._HoldWinDown == prevKeyState._HoldWinDown &&
-        keyState._HoldAppDown == prevKeyState._HoldAppDown &&
-        keyState._SwitchAppDown == prevKeyState._SwitchAppDown &&
-        keyState._EscapeDown == prevKeyState._EscapeDown &&
-        keyState._PrevAppDown == prevKeyState._PrevAppDown)
-        return CallNextHookEx(NULL, nCode, wParam, lParam);
 
     // Update target app state
     bool bypassMsg = false;
     const Mode prevMode = mode;
     {
-        const bool switchWinInput = !prevKeyState._SwitchWinDown && keyState._SwitchWinDown;
-        const bool switchAppInput = !prevKeyState._SwitchAppDown && keyState._SwitchAppDown;
-        const bool prevAppInput = !prevKeyState._PrevAppDown && keyState._PrevAppDown;
+        const bool switchWinInput = isWinSwitch && !rel;
+        const bool switchAppInput = isAppSwitch && !rel;
+        const bool prevAppInput = isPrevApp && !rel;
         const bool winHoldReleasing = prevKeyState._HoldWinDown && !keyState._HoldWinDown;
         const bool appHoldReleasing = prevKeyState._HoldAppDown && !keyState._HoldAppDown;
-        const bool escapeInput = !prevKeyState._EscapeDown && keyState._EscapeDown;
+        const bool escapeInput = isEscape && !rel;
 
         const bool switchApp =
             switchAppInput &&
@@ -1253,30 +1296,27 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
             escapeInput &&
             keyState._HoldAppDown;
 
-        bool isApplying = false;
-
         // Denit.
         if ((prevMode == ModeApp) &&
             (switchWin || appHoldReleasing) && !prevApp)
         {
             mode = ModeNone;
-            isApplying = true;
-            PostThreadMessage(_MainThread, MSG_DEINIT_APP, 0, 0);
+            bypassMsg = true;
+            PostThreadMessage(_MainThread, MSG_DEINIT_APP, kbStrut.vkCode, 0);
         }
         else if (prevMode == ModeWin &&
             (switchApp || winHoldReleasing))
         {
             mode = switchAppInput ? ModeApp : ModeNone;
-            isApplying = true;
-            PostThreadMessage(_MainThread, MSG_DEINIT_WIN, 0, 0);
+            bypassMsg = true;
+            PostThreadMessage(_MainThread, MSG_DEINIT_WIN, kbStrut.vkCode, 0);
         }
         else if (prevMode == ModeApp && cancel)
         {
             mode = ModeNone;
-            isApplying = true;
-            PostThreadMessage(_MainThread, MSG_CANCEL_APP, 0, 0);
+            bypassMsg = true;
+            PostThreadMessage(_MainThread, MSG_CANCEL_APP, kbStrut.vkCode, 0);
         }
-
 
         if (mode == ModeNone && switchApp)
             mode = ModeApp;
@@ -1285,39 +1325,37 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
 
         if (mode == ModeApp && prevMode != ModeApp)
         {
+            bypassMsg = true;
             PostThreadMessage(_MainThread, MSG_INIT_APP, 0, 0);
         }
         else if (mode == ModeWin && prevMode != ModeWin)
         {
+            bypassMsg = true;
             PostThreadMessage(_MainThread, MSG_INIT_WIN, 0, 0);
         }
 
         if (mode == ModeApp)
         {
+            bypassMsg = true;
             if (switchApp)
+            {
+                if (!keyState._InvertKeyDown && !(mode == ModeApp && prevMode != ModeApp))
+                    printf("heu");
                 PostThreadMessage(_MainThread, keyState._InvertKeyDown ? MSG_PREV_APP : MSG_NEXT_APP, 0, 0);
+            }
             else if (prevApp)
                 PostThreadMessage(_MainThread, MSG_PREV_APP, 0, 0);
         }
         else if (switchWin)
         {
+            bypassMsg = true;
             PostThreadMessage(_MainThread, keyState._InvertKeyDown ? MSG_PREV_WIN : MSG_NEXT_WIN, 0, 0);
         }
-
-        bypassMsg =
-            ((mode != ModeNone) || isApplying) &&
-            (isWinSwitch || isAppSwitch || isWinHold || isAppHold || isInvert || isPrevApp);
     }
 
     if (bypassMsg)
-    {
-        // https://stackoverflow.com/questions/2914989/how-can-i-deal-with-depressed-windows-logo-key-when-using-sendinput
-        if (releasing && (isWinHold || isAppHold || isInvert))
-        {
-            PostThreadMessage(_MainThread, MSG_RESTORE_KEY, kbStrut.vkCode, 0);
-        }
         return 1;
-    }
+
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
@@ -1403,8 +1441,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         appData->_Mode = ModeNone;
         appData->_Selection = 0;
         appData->_MouseSelection = 0;
-        DestroyWin(appData->_MainWin);
         ApplySwitchApp(&appData->_WinGroups._Data[selection]);
+        DestroyWin(appData->_MainWin);
         ClearWinGroupArr(&appData->_WinGroups);
         return 0;
     }
@@ -1491,7 +1529,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
                     COLORREF cr = pGraphRes->_TextColor;
                     ARGB gdipColor = cr | 0xFF000000;
                     GpPen* pPen;
-                    GdipCreatePen1(gdipColor, pathThickness, 2, &pPen);
+                    GdipCreatePen1(gdipColor, 2, UnitPixel, &pPen);
                     DrawRoundedRect(pGraphics, pPen, NULL, &selRect, 10);
                     GdipDeletePen(pPen);
                 }
@@ -1771,19 +1809,21 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
         }
         case MSG_DEINIT_APP:
         {
+            RestoreKey(msg.wParam);
             if (_AppData._Mode == ModeNone)
                 break;
             const int selection = _AppData._Selection;
             _AppData._Mode = ModeNone;
             _AppData._Selection = 0;
 
-            DestroyWin(_AppData._MainWin);
             ApplySwitchApp(&_AppData._WinGroups._Data[selection]);
+            DestroyWin(_AppData._MainWin);
             ClearWinGroupArr(&_AppData._WinGroups);
             break;
         }
         case MSG_CANCEL_APP:
         {
+            RestoreKey(msg.wParam);
             _AppData._Mode = ModeNone;
             DestroyWin(_AppData._MainWin);
             ClearWinGroupArr(&_AppData._WinGroups);
@@ -1791,6 +1831,7 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
         }
         case MSG_DEINIT_WIN:
         {
+            RestoreKey(msg.wParam);
             if (_AppData._Mode == ModeNone)
                 break;
             _AppData._Mode = ModeNone;
