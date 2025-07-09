@@ -88,6 +88,7 @@ typedef struct Metrics
     float _Container;
     float _Selection;
     float _Icon;
+    float _Pad;
 } Metrics;
 
 typedef enum Mode
@@ -575,10 +576,10 @@ static void GetUWPIconAndAppName(HANDLE process, wchar_t* outIconPath, wchar_t* 
         IAppxManifestApplication* app = NULL;
         BOOL hasApp = false;
         IAppxManifestApplicationsEnumerator_GetHasCurrent(appEnum, &hasApp);
-        IAppxManifestApplicationsEnumerator_GetCurrent(appEnum, &app);
         while (hasApp)
         {
             static wchar_t* aumid = NULL;
+            IAppxManifestApplicationsEnumerator_GetCurrent(appEnum, &app);
             IAppxManifestApplication_GetAppUserModelId(app, &aumid);
             if (!wcscmp(aumid, userModelID))
             {
@@ -1026,21 +1027,23 @@ static void ComputeMetrics(uint32_t iconCount, float scale, Metrics *metrics)
     const int centerY = GetSystemMetrics(SM_CYSCREEN) / 2;
     const int centerX = GetSystemMetrics(SM_CXSCREEN) / 2;
     const int screenWidth = GetSystemMetrics(SM_CXFULLSCREEN);
-    const float containerRatio = 2.0f;
-    const float selectRatio = 1.25f;
-    const float iconSize = GetSystemMetrics(SM_CXICON) * scale;
-    float iconContainerSize = min(iconSize * containerRatio, (screenWidth * 0.9) / iconCount);
-    const uint32_t sizeX = iconCount * iconContainerSize;
+    const float containerRatio = 1.25f;
+    const float selectRatio = 1.25f; // Same as container, legacy was different
+    float iconSize = GetSystemMetrics(SM_CXICON) * scale;
+    const float padRatio = max(0.25 * iconSize, 16.0f) / iconSize; // Keep room for app name
+    const uint32_t sizeX = min(iconSize * (iconCount * containerRatio + 2.0f * padRatio), screenWidth * 0.9);
+    iconSize = sizeX / (iconCount * containerRatio + 2.0f * padRatio);
     const uint32_t halfSizeX = sizeX / 2;
-    const uint32_t sizeY = 1 * iconContainerSize;
+    const uint32_t sizeY = 1 * iconSize * containerRatio + 2.0f * padRatio * iconSize;
     const uint32_t halfSizeY = sizeY / 2;
     metrics->_WinPosX = centerX - halfSizeX;
     metrics->_WinPosY = centerY - halfSizeY;
     metrics->_WinX = sizeX;
     metrics->_WinY = sizeY;
-    metrics->_Icon = ceil(iconContainerSize / containerRatio);
-    metrics->_Container = iconContainerSize;
-    metrics->_Selection =  metrics->_Icon * selectRatio;
+    metrics->_Icon = iconSize;
+    metrics->_Container = iconSize * containerRatio;
+    metrics->_Selection =  iconSize * selectRatio;
+    metrics->_Pad = iconSize * padRatio; 
 }
 
 static const char CLASS_NAME[] = "AltAppSwitcher";
@@ -1051,6 +1054,8 @@ static void DestroyWin(HWND win)
     win = NULL;
 }
 
+static void Draw(SAppData* appData, HDC dc, RECT clientRect);
+
 static void CreateWin(SAppData* appData)
 {
     if (appData->_MainWin)
@@ -1059,10 +1064,10 @@ static void CreateWin(SAppData* appData)
     ComputeMetrics(appData->_WinGroups._Size, appData->_Config._Scale, &appData->_Metrics);
 
     HWND hwnd = CreateWindowEx(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW, // Optional window styles (WS_EX_)
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, // Optional window styles (WS_EX_)
         CLASS_NAME, // Window class
         "", // Window text
-        WS_BORDER | WS_POPUP | WS_VISIBLE, // Window style
+        WS_BORDER | WS_POPUP, // Window style
         // Pos and size
         appData->_Metrics._WinPosX, appData->_Metrics._WinPosY, appData->_Metrics._WinX, appData->_Metrics._WinY,
         NULL, // Parent window
@@ -1088,6 +1093,13 @@ static void CreateWin(SAppData* appData)
     UpdateWindow(hwnd);
     SetForegroundWindow(hwnd);
     appData->_MainWin = hwnd;
+
+    SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    ShowWindow(hwnd, SW_SHOW);
+    RECT clientRect = { 0, 0, appData->_Metrics._WinX, appData->_Metrics._WinY };
+    Draw(appData, GetDC(hwnd), clientRect);
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    //AnimateWindow(hwnd, 1, AW_ACTIVATE | AW_BLEND);
 }
 
 static void InitializeSwitchApp(SAppData* appData)
@@ -1161,9 +1173,9 @@ static void UIASetFocus(HWND win, IUIAutomation* UIA)
 {
     IUIAutomationElement* el = NULL;
     DWORD res = IUIAutomation_ElementFromHandle(UIA, win, &el);
-    ASSERT(SUCCEEDED(res));
+    VERIFY(SUCCEEDED(res));
     res = IUIAutomationElement_SetFocus(el);
-    ASSERT(SUCCEEDED(res));
+    VERIFY(SUCCEEDED(res));
     IUIAutomationElement_Release(el);
 }
 
@@ -1412,6 +1424,183 @@ static bool IsInside(int x, int y, HWND win)
     return x > r.left && x < r.right && y > r.top && y < r.bottom;
 }
 
+static void Draw(SAppData* appData, HDC dc, RECT clientRect)
+{
+    HWND hwnd = appData->_MainWin;
+    SGraphicsResources* pGraphRes = &appData->_GraphicsResources;
+
+    HANDLE oldBitmap = SelectObject(pGraphRes->_DC, pGraphRes->_Bitmap);
+    ASSERT(oldBitmap != NULL);
+    ASSERT(oldBitmap != HGDI_ERROR);
+
+    HBRUSH bgBrush = CreateSolidBrush(pGraphRes->_BackgroundColor);
+    FillRect(pGraphRes->_DC, &clientRect, bgBrush);
+    DeleteObject(bgBrush);
+
+    SetBkMode(pGraphRes->_DC, TRANSPARENT); // ?
+
+    GpGraphics* pGraphics = NULL;
+    ASSERT(Ok == GdipCreateFromHDC(pGraphRes->_DC, &pGraphics));
+    // gdiplus/gdiplusenums.h
+    GdipSetSmoothingMode(pGraphics, SmoothingModeAntiAlias);
+    GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeNone);
+    GdipSetInterpolationMode(pGraphics, InterpolationModeHighQualityBilinear); // InterpolationModeHighQualityBicubic
+    GdipSetTextRenderingHint(pGraphics, TextRenderingHintClearTypeGridFit);
+
+    const float containerSize = appData->_Metrics._Container;
+    const float iconSize = appData->_Metrics._Icon;
+    const float selectSize = appData->_Metrics._Selection;
+    const float pad = appData->_Metrics._Pad;
+    const float padSelect = (containerSize - selectSize) * 0.5f;
+    const float padIcon = (containerSize - iconSize) * 0.5f;
+    const float digitBoxHeight = min(max(selectSize * 0.15f, 16.0f), selectSize * 0.5f);
+    const float digitBoxPad = digitBoxHeight * 0.15f;
+    const float digitHeight = digitBoxHeight * 0.75f;
+    const float digitPad = digitBoxHeight * 0.1f; (void)digitPad; // Implicit as text centering is handled by gdip
+    const float nameHeight = pad * 0.6f;
+    const float namePad = pad * 0.2f;
+    const float pathThickness = 2.0f;
+
+    float x = pad;
+    float y = pad;
+
+    // Resources
+    GpFont* fontName = NULL;
+    GpFontFamily* pFontFamily = NULL;
+    {
+        GpFontCollection* fc = NULL;
+        ASSERT(Ok == GdipNewInstalledFontCollection(&fc));
+        ASSERT(Ok == GdipCreateFontFamilyFromName(L"Segoe UI", fc, &pFontFamily));
+        ASSERT(Ok == GdipCreateFont(pFontFamily, nameHeight, FontStyleRegular, (int)MetafileFrameUnitPixel, &fontName));
+    }
+
+
+
+    // Selection box
+    {
+        const uint32_t selIdx = (uint32_t)appData->_Selection;
+        const uint32_t mouseSelIdx = (uint32_t)appData->_MouseSelection;
+
+        {
+            RectF selRect = { pad + containerSize * selIdx + padSelect, pad + padSelect, selectSize, selectSize };
+            DrawRoundedRect(pGraphics, NULL, pGraphRes->_pBrushBgHighlight, &selRect, 10);
+        }
+
+        {
+            RectF selRect = { pad + containerSize * mouseSelIdx + padSelect, pad + padSelect, selectSize, selectSize };
+            COLORREF cr = pGraphRes->_TextColor;
+            ARGB gdipColor = cr | 0xFF000000;
+            GpPen* pPen;
+            GdipCreatePen1(gdipColor, 2, UnitPixel, &pPen);
+            DrawRoundedRect(pGraphics, pPen, NULL, &selRect, 10);
+            GdipDeletePen(pPen);
+        }
+    }
+
+    for (uint32_t i = 0; i < appData->_WinGroups._Size; i++)
+    {
+        const SWinGroup* pWinGroup = &appData->_WinGroups._Data[i];
+
+        // Icon
+        // TODO: Check histogram and invert (or another filter) if background is similar
+        // https://learn.microsoft.com/en-us/windows/win32/api/gdiplusheaders/nf-gdiplusheaders-bitmap-gethistogram
+        // https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-using-a-color-remap-table-use
+        // https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-using-a-color-matrix-to-transform-a-single-color-use
+        // Also check palette to see if monochrome
+        if (pWinGroup->_IconBitmap)
+        {
+            GdipDrawImageRectI(pGraphics, pWinGroup->_IconBitmap, x + padIcon, y + padIcon, iconSize, iconSize);
+        }
+
+        // Digit
+        if (appData->_Config._AppSwitcherMode == AppSwitcherModeApp && pWinGroup->_WindowCount > 1)
+        {
+            WCHAR str[] = L"\0\0";
+            const uint32_t winCount = min(pWinGroup->_WindowCount, 99);
+            const uint32_t digitsCount = winCount > 9 ? 2 : 1;
+            const float w = digitBoxHeight;
+            const float h = digitBoxHeight;
+            const float p = digitBoxPad + pathThickness;
+            RectF r = {
+                (x + padSelect + selectSize - p - w),
+                (y + padSelect + selectSize - p - h),
+                (w),
+                (h) };
+            r.X = round(r.X);
+            r.Y = round(r.Y);
+            r.Width = round(r.Width);
+            r.Height = round(r.Height);
+
+            swprintf(str, 3, L"%i", winCount);
+            // Invert text / bg brushes 
+            DrawRoundedRect(pGraphics, NULL, pGraphRes->_pBrushText, &r, 5);
+
+            GpPath* pPath;
+            ASSERT(Ok == GdipCreatePath(FillModeAlternate, &pPath));
+            RectF rr = {0, 0, 0, 0};
+            ASSERT(Ok == GdipAddPathString(pPath, str, digitsCount, pFontFamily, FontStyleBold, digitHeight * (digitsCount > 1 ? 0.8f : 1.0f), &rr, pGraphRes->_pFormat));
+            ASSERT(Ok == GdipGetPathWorldBounds(pPath, &rr, NULL, NULL));
+            rr.X = round(rr.X);
+            rr.Y = round(rr.Y);
+            rr.Width = round(rr.Width);
+            rr.Height = round(rr.Height);
+            GpMatrix* mat;
+            ASSERT(Ok == GdipCreateMatrix2(1.0f, 0.0f, 0.0f, 1.0f, (r.X - rr.X + (r.Width - rr.Width) * 0.5f), (r.Y - rr.Y + (r.Height - rr.Height) * 0.5f), &mat));
+            ASSERT(Ok == GdipTransformPath(pPath, mat));
+            ASSERT(Ok == GdipDeleteMatrix(mat));
+            ASSERT(Ok == GdipFillPath(pGraphics, pGraphRes->_pBrushBg, pPath));
+            ASSERT(Ok == GdipDeletePath(pPath));
+
+            // ASSERT(!GdipDrawString(pGraphics, str, digitsCount, digitsCount == 2 ? font2Digits : font1Digit, &r, pGraphRes->_pFormat, pGraphRes->_pBrushBg));
+        }
+
+        // Name
+        const bool selected = i == (uint32_t)appData->_Selection;
+        const bool mouseSelected = i == (uint32_t)appData->_MouseSelection;
+
+        if (((selected || mouseSelected) && appData->_Config._DisplayName == DisplayNameSel) ||
+            appData->_Config._DisplayName == DisplayNameAll)
+        {
+            //https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-obtaining-font-metrics-use
+            const float h = nameHeight;
+            const float p = namePad;
+            const float w = containerSize - 2.0f * p;
+            RectF r = {
+                (int)(x + p),
+                (int)(y + containerSize - padSelect + p),
+                (int)(w),
+                (int)(h) };
+            static wchar_t name[MAX_PATH];
+            int count = wcslen(pWinGroup->_AppName);
+            if (count != 0)
+            {
+                RectF rout;
+                int maxCount = 0;
+                GdipMeasureString(pGraphics, pWinGroup->_AppName, count, fontName, &r, pGraphRes->_pFormat, &rout, &maxCount, 0);
+                wcsncpy(name, pWinGroup->_AppName, min(maxCount, count));
+                if (count > maxCount)
+                {
+                    wcscpy(&name[maxCount - 3], L"...");
+                    count = maxCount;
+                }
+                GdipDrawString(pGraphics, name, count, fontName, &r, pGraphRes->_pFormat, pGraphRes->_pBrushText);
+            }
+        }
+
+        x += containerSize;
+    }
+    BitBlt(GetDC(hwnd), clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, pGraphRes->_DC, 0, 0, SRCCOPY);
+
+    // Always restore old bitmap (see fn doc)
+    SelectObject(pGraphRes->_DC, oldBitmap);
+
+    // Delete res.
+    GdipDeleteFont(fontName);
+    GdipDeleteFontFamily(pFontFamily);
+
+    GdipDeleteGraphics(pGraphics);
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     static SAppData* appData = NULL;
@@ -1422,8 +1611,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         if (!appData->_Config._Mouse)
             return 0;
         const int iconContainerSize = (int)appData->_Metrics._Container;
+        const int pad = (int)appData->_Metrics._Pad;
         const int posX = GET_X_LPARAM(lParam);
-        appData->_MouseSelection = min(max(0, posX / iconContainerSize), (int)appData->_WinGroups._Size);
+        appData->_MouseSelection = min(max(0, (posX - pad) / iconContainerSize), (int)appData->_WinGroups._Size - 1);
         InvalidateRect(appData->_MainWin, 0, FALSE);
         UpdateWindow(appData->_MainWin);
         return 0;
@@ -1486,179 +1676,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             ASSERT(false);
             return 0;
         }
-
-        SGraphicsResources* pGraphRes = &appData->_GraphicsResources;
-
-        HANDLE oldBitmap = SelectObject(pGraphRes->_DC, pGraphRes->_Bitmap);
-        ASSERT(oldBitmap != NULL);
-        ASSERT(oldBitmap != HGDI_ERROR);
-
         RECT clientRect;
         ASSERT(GetClientRect(hwnd, &clientRect));
-
-        HBRUSH bgBrush = CreateSolidBrush(pGraphRes->_BackgroundColor);
-        FillRect(pGraphRes->_DC, &clientRect, bgBrush);
-        DeleteObject(bgBrush);
-
-        SetBkMode(pGraphRes->_DC, TRANSPARENT); // ?
-
-        GpGraphics* pGraphics = NULL;
-        ASSERT(Ok == GdipCreateFromHDC(pGraphRes->_DC, &pGraphics));
-        // gdiplus/gdiplusenums.h
-        GdipSetSmoothingMode(pGraphics, SmoothingModeAntiAlias);
-        GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeNone);
-        GdipSetInterpolationMode(pGraphics, InterpolationModeHighQualityBilinear); // InterpolationModeHighQualityBicubic
-        GdipSetTextRenderingHint(pGraphics, TextRenderingHintClearTypeGridFit);
-
-        const float containerSize = appData->_Metrics._Container;
-        const float iconSize = appData->_Metrics._Icon;
-        const float selectSize = appData->_Metrics._Selection;
-        const float padSelect = (containerSize - selectSize) * 0.5f;
-        const float padIcon = (containerSize - iconSize) * 0.5f;
-        const float digitBoxHeight = min(max(selectSize * 0.15f, 16.0f), selectSize * 0.5f);
-        const float digitBoxPad = digitBoxHeight * 0.15f;
-        const float digitHeight = digitBoxHeight * 0.75f;
-        const float digitPad = digitBoxHeight * 0.1f; (void)digitPad; // Implicit as text centering is handled by gdip
-        const float nameHeight = padSelect * 0.6f;
-        const float namePad = padSelect * 0.2f;
-        const float pathThickness = 2.0f;
-
-        float x = 0;
-
-        // Resources
-        GpFont* fontName = NULL;
-        GpFontFamily* pFontFamily = NULL;
-        {
-            GpFontCollection* fc = NULL;
-            ASSERT(Ok == GdipNewInstalledFontCollection(&fc));
-            ASSERT(Ok == GdipCreateFontFamilyFromName(L"Segoe UI", fc, &pFontFamily));
-            ASSERT(Ok == GdipCreateFont(pFontFamily, nameHeight, FontStyleRegular, (int)MetafileFrameUnitPixel, &fontName));
-        }
-
-        for (uint32_t i = 0; i < appData->_WinGroups._Size; i++)
-        {
-            const SWinGroup* pWinGroup = &appData->_WinGroups._Data[i];
-            const bool selected = i == (uint32_t)appData->_Selection;
-            const bool mouseSelected = i == (uint32_t)appData->_MouseSelection;
-            // Selection box
-            {
-                RectF selRect = { x + padSelect, padSelect, selectSize, selectSize };
-
-                if (mouseSelected)
-                {
-                    DrawRoundedRect(pGraphics, NULL, pGraphRes->_pBrushBgHighlight, &selRect, 10);
-                }
-
-                if (selected)
-                {
-                    COLORREF cr = pGraphRes->_TextColor;
-                    ARGB gdipColor = cr | 0xFF000000;
-                    GpPen* pPen;
-                    GdipCreatePen1(gdipColor, 2, UnitPixel, &pPen);
-                    DrawRoundedRect(pGraphics, pPen, NULL, &selRect, 10);
-                    GdipDeletePen(pPen);
-                }
-            }
-
-            // Icon
-            // TODO: Check histogram and invert (or another filter) if background is similar
-            // https://learn.microsoft.com/en-us/windows/win32/api/gdiplusheaders/nf-gdiplusheaders-bitmap-gethistogram
-            // https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-using-a-color-remap-table-use
-            // https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-using-a-color-matrix-to-transform-a-single-color-use
-            // Also check palette to see if monochrome
-            if (pWinGroup->_IconBitmap)
-            {
-                GdipDrawImageRectI(pGraphics, pWinGroup->_IconBitmap, x + padIcon, padIcon, iconSize, iconSize);
-            }
-
-            // Digit
-            if (appData->_Config._AppSwitcherMode == AppSwitcherModeApp && pWinGroup->_WindowCount > 1)
-            {
-                WCHAR str[] = L"\0\0";
-                const uint32_t winCount = min(pWinGroup->_WindowCount, 99);
-                const uint32_t digitsCount = winCount > 9 ? 2 : 1;
-                const float w = digitBoxHeight;
-                const float h = digitBoxHeight;
-                const float p = digitBoxPad + pathThickness;
-                RectF r = {
-                    (x + padSelect + selectSize - p - w),
-                    (padSelect + selectSize - p - h),
-                    (w),
-                    (h) };
-                r.X = round(r.X);
-                r.Y = round(r.Y);
-                r.Width = round(r.Width);
-                r.Height = round(r.Height);
-
-                swprintf(str, 3, L"%i", winCount);
-                // Invert text / bg brushes 
-                DrawRoundedRect(pGraphics, NULL, pGraphRes->_pBrushText, &r, 5);
-
-                GpPath* pPath;
-                ASSERT(Ok == GdipCreatePath(FillModeAlternate, &pPath));
-                RectF rr = {0, 0, 0, 0};
-                ASSERT(Ok == GdipAddPathString(pPath, str, digitsCount, pFontFamily, FontStyleBold, digitHeight * (digitsCount > 1 ? 0.8f : 1.0f), &rr, pGraphRes->_pFormat));
-                ASSERT(Ok == GdipGetPathWorldBounds(pPath, &rr, NULL, NULL));
-                rr.X = round(rr.X);
-                rr.Y = round(rr.Y);
-                rr.Width = round(rr.Width);
-                rr.Height = round(rr.Height);
-                GpMatrix* mat;
-                ASSERT(Ok == GdipCreateMatrix2(1.0f, 0.0f, 0.0f, 1.0f, (r.X - rr.X + (r.Width - rr.Width) * 0.5f), (r.Y - rr.Y + (r.Height - rr.Height) * 0.5f), &mat));
-                ASSERT(Ok == GdipTransformPath(pPath, mat));
-                ASSERT(Ok == GdipDeleteMatrix(mat));
-                ASSERT(Ok == GdipFillPath(pGraphics, pGraphRes->_pBrushBg, pPath));
-                ASSERT(Ok == GdipDeletePath(pPath));
-
-                // ASSERT(!GdipDrawString(pGraphics, str, digitsCount, digitsCount == 2 ? font2Digits : font1Digit, &r, pGraphRes->_pFormat, pGraphRes->_pBrushBg));
-            }
-
-            // Name
-            if (((selected || mouseSelected) && appData->_Config._DisplayName == DisplayNameSel) ||
-                appData->_Config._DisplayName == DisplayNameAll)
-            {
-                //https://learn.microsoft.com/en-us/windows/win32/gdiplus/-gdiplus-obtaining-font-metrics-use
-                const float h = nameHeight;
-                const float p = namePad;
-                const float w = containerSize - 2.0f * p;
-                RectF r = {
-                    (int)(x + p),
-                    (int)(containerSize - padSelect + p),
-                    (int)(w),
-                    (int)(h) };
-                static wchar_t name[MAX_PATH];
-                int count = wcslen(pWinGroup->_AppName);
-                if (count != 0)
-                {
-                    RectF rout;
-                    int maxCount = 0;
-                    GdipMeasureString(pGraphics, pWinGroup->_AppName, count, fontName, &r, pGraphRes->_pFormat, &rout, &maxCount, 0);
-                    wcsncpy(name, pWinGroup->_AppName, min(maxCount, count));
-                    if (count > maxCount)
-                    {
-                        wcscpy(&name[maxCount - 3], L"...");
-                        count = maxCount;
-                    }
-                    GdipDrawString(pGraphics, name, count, fontName, &r, pGraphRes->_pFormat, pGraphRes->_pBrushText);
-                }
-            }
-
-            x += (int)containerSize;
-        }
-        BitBlt(ps.hdc, clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, pGraphRes->_DC, 0, 0, SRCCOPY);
-
-        // Always restore old bitmap (see fn doc)
-        SelectObject(pGraphRes->_DC, oldBitmap);
-
-        // Delete res.
-        GdipDeleteFont(fontName);
-        GdipDeleteFontFamily(pFontFamily);
-
-        GdipDeleteGraphics(pGraphics);
+        Draw(appData, ps.hdc, clientRect);
         EndPaint(hwnd, &ps);
-
         return 0;
     }
+    // case WM_SHOWWINDOW:
+    // {
+    //     if (!GetLayeredWindowAttributes(hwnd, NULL, NULL, NULL))
+    //     {
+    //         SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+    //         // DefWindowProc(hwnd, WM_ERASEBKGND, (WPARAM)GetDC(hwnd), lParam);
+    //         //DefWindowProc(hwnd, WM_PAINT, (WPARAM)GetDC(hwnd), lParam);
+    //         LRESULT r = DefWindowProc(hwnd, uMsg, wParam, lParam);
+    //         SendMessage(hwnd, WM_PAINT, 0, 0);
+
+    //         SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+    //         AnimateWindow(hwnd, 1, AW_ACTIVATE|AW_BLEND);
+    //         return r;
+    //     }
+    //     return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    // }
+    break;
     case WM_ERASEBKGND:
         return (LRESULT)0;
     }
@@ -1733,6 +1773,17 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
         _AppData._Config._Scale = 1.75;
         _AppData._Config._DisplayName = DisplayNameSel;
         LoadConfig(&_AppData._Config);
+
+        // Patch only for runtime use. Do not patch if used for serialization.
+#define PATCH_TILDE(key) key = key == VK_OEM_3 ? MapVirtualKey(41, MAPVK_VSC_TO_VK) : key;
+    PATCH_TILDE(_AppData._Config._Key._AppHold);
+    PATCH_TILDE(_AppData._Config._Key._AppSwitch);
+    PATCH_TILDE(_AppData._Config._Key._WinHold);
+    PATCH_TILDE(_AppData._Config._Key._WinSwitch);
+    PATCH_TILDE(_AppData._Config._Key._Invert);
+    PATCH_TILDE(_AppData._Config._Key._PrevApp);
+#undef PATCH_TILDE
+
         _AppData._Elevated = false;
         {
             HANDLE tok;
