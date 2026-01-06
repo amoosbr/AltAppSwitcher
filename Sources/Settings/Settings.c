@@ -44,6 +44,8 @@ static void SetupGUI(GUIData* gui, void* userData)
     CreateComboBox("Display app name.", &cfg->_DisplayName, displayNameES, gui);
     CreateText("Multiple monitor:", "", gui);
     CreateComboBox("Multiple monitor display mode.", &cfg->_MultipleMonitorMode, multipleMonitorModeES, gui);
+    CreateText("Restore minimized windows:", "", gui);
+    CreateBoolControl("", &cfg->_RestoreMinimizedWindows, gui);
 
     GridLayout(1, gui);
     CreateText("Other:", "", gui);
@@ -59,7 +61,9 @@ static void SetupGUI(GUIData* gui, void* userData)
     CreateText("App filter mode:", "", gui);
     CreateComboBox("All: show apps from all monitors.\nmouse monitor: show only apps from the monitor where mouse cursor is located.",
         &cfg->_AppFilterMode, appFilterModeES, gui);
-
+    CreateText("Desktop filter:", "", gui);
+    CreateComboBox("",
+        &cfg->_DesktopFilter, desktopFilterES, gui);
     GridLayout(1, gui);
     CreateButton("Apply", (HMENU)APPLY_BUTTON_ID, gui);
 }

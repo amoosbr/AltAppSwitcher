@@ -1,5 +1,4 @@
 #include "Config.h"
-#include "_Generated/ConfigStr.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <Winuser.h>
@@ -60,6 +59,13 @@ const EnumString appFilterModeES[3] = {
     { "end", 0xFFFFFFFF }
 };
 
+const EnumString desktopFilterES[3] =
+{
+    { "current", DesktopFilterCurrent },
+    { "all", DesktopFilterAll },
+    { "end", 0xFFFFFFFF }
+};
+
 typedef struct StrPair
 {
     char Key[64];
@@ -101,7 +107,6 @@ static bool TryGetFloat(const StrPair* keyValues, const char* token, float* floa
     unsigned int entry = Find(keyValues, token);
     if (entry == 0xFFFFFFFF)
     {
-        DebugBreak();
         return false;
     }
     *floatToSet = strtof(keyValues[entry].Value, NULL);
@@ -109,12 +114,11 @@ static bool TryGetFloat(const StrPair* keyValues, const char* token, float* floa
 }
 
 static bool TryGetEnum(const StrPair* keyValues, const char* token,
-    unsigned int* outValue, const EnumString* enumStrings, unsigned int defaultValue)
+    unsigned int* outValue, const EnumString* enumStrings)
 {
     unsigned int entry = Find(keyValues, token);
     if (entry == 0xFFFFFFFF)
     {
-        *outValue = defaultValue;
         return false;
     }
     for (unsigned int i = 0; enumStrings[i].Value != 0xFFFFFFFF; i++)
@@ -129,21 +133,40 @@ static bool TryGetEnum(const StrPair* keyValues, const char* token,
     return false;
 }
 
+void DefaultConfig(Config* config)
+{
+    config->_Key._AppHold = VK_LMENU;
+    config->_Key._AppSwitch = VK_TAB;
+    config->_Key._WinHold = VK_LMENU;
+    config->_Key._WinSwitch = VK_OEM_3;
+    config->_Key._Invert = VK_LSHIFT;
+    config->_Key._PrevApp = VK_OEM_3;
+    config->_Mouse = true;
+    config->_CheckForUpdates = true;
+    config->_ThemeMode = ThemeModeAuto;
+    config->_AppSwitcherMode = AppSwitcherModeApp;
+    config->_Scale = 2.5;
+    config->_DisplayName = DisplayNameSel;
+    config->_MultipleMonitorMode = MultipleMonitorModeMouse;
+    config->_AppFilterMode = AppFilterModeAll;
+    config->_RestoreMinimizedWindows = true;
+    config->_DesktopFilter = DesktopFilterCurrent;
+}
+
 void LoadConfig(Config* config)
 {
+    DefaultConfig(config);
     char configFile[MAX_PATH] = {};
     ConfigPath(configFile);
     FILE* file = fopen(configFile ,"rb");
     if (file == NULL)
     {
-        file = fopen(configFile ,"a");
-        fprintf(file, ConfigStr);
-        fclose(file);
-        fopen(configFile ,"rb");
+        WriteConfig(config);
+        return;
     }
 
-#define GET_ENUM(ENTRY, DST, ENUM_STRING, DEFAULT)\
-TryGetEnum(keyValues, ENTRY, &DST, ENUM_STRING, DEFAULT)
+#define GET_ENUM(ENTRY, DST, ENUM_STRING)\
+TryGetEnum(keyValues, ENTRY, &DST, ENUM_STRING)
 
 #define GET_BOOL(ENTRY, DST)\
 TryGetBool(keyValues, ENTRY, &DST)
@@ -172,18 +195,20 @@ TryGetFloat(keyValues, ENTRY, &DST)
     }
     fclose(file);
 
-    GET_ENUM("app hold key", config->_Key._AppHold, keyES, AAS_NONE_VK);
-    GET_ENUM("next app key", config->_Key._AppSwitch, keyES, AAS_NONE_VK);
-    GET_ENUM("window hold key", config->_Key._WinHold, keyES, AAS_NONE_VK);
-    GET_ENUM("next window key", config->_Key._WinSwitch, keyES, AAS_NONE_VK);
-    GET_ENUM("invert order key", config->_Key._Invert, keyES, AAS_NONE_VK);
-    GET_ENUM("previous app key", config->_Key._PrevApp, keyES, AAS_NONE_VK);
+    GET_ENUM("app hold key", config->_Key._AppHold, keyES);
+    GET_ENUM("next app key", config->_Key._AppSwitch, keyES);
+    GET_ENUM("window hold key", config->_Key._WinHold, keyES);
+    GET_ENUM("next window key", config->_Key._WinSwitch, keyES);
+    GET_ENUM("invert order key", config->_Key._Invert, keyES);
+    GET_ENUM("previous app key", config->_Key._PrevApp, keyES);
 
-    GET_ENUM("theme", config->_ThemeMode, themeES, ThemeModeAuto);
-    GET_ENUM("app switcher mode", config->_AppSwitcherMode, appSwitcherModeES, AppSwitcherModeApp);
-    GET_ENUM("display name", config->_DisplayName, displayNameES, DisplayNameSel);
-    GET_ENUM("multiple monitor mode", config->_MultipleMonitorMode, multipleMonitorModeES, MultipleMonitorModeMouse);
-    GET_ENUM("app filter mode", config->_AppFilterMode, appFilterModeES, AppFilterModeAll);
+    GET_ENUM("theme", config->_ThemeMode, themeES);
+    GET_ENUM("app switcher mode", config->_AppSwitcherMode, appSwitcherModeES);
+    GET_ENUM("display name", config->_DisplayName, displayNameES);
+    GET_ENUM("multiple monitor mode", config->_MultipleMonitorMode, multipleMonitorModeES);
+    GET_ENUM("app filter mode", config->_AppFilterMode, appFilterModeES);
+    GET_ENUM("desktop filter", config->_DesktopFilter, desktopFilterES);
+    GET_BOOL("restore minimized windows", config->_RestoreMinimizedWindows);
 
     GET_BOOL("allow mouse", config->_Mouse);
     GET_BOOL("check for updates", config->_CheckForUpdates);
@@ -245,6 +270,8 @@ WriteFloat(file, ENTRY, VALUE)
     WRITE_ENUM("display name", config->_DisplayName, displayNameES);
     WRITE_ENUM("multiple monitor mode", config->_MultipleMonitorMode, multipleMonitorModeES);
     WRITE_ENUM("app filter mode", config->_AppFilterMode, appFilterModeES);
+    WRITE_ENUM("desktop filter", config->_DesktopFilter, desktopFilterES);
+    WRITE_BOOL("restore minimized windows", config->_RestoreMinimizedWindows);
 
     WRITE_BOOL("allow mouse", config->_Mouse);
     WRITE_BOOL("check for updates", config->_CheckForUpdates);

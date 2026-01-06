@@ -26,7 +26,6 @@
 #include <PropKey.h>
 #include <winuser.h>
 #include <winnt.h>
-#include <pthread.h>
 #include <time.h>
 #include <Shobjidl.h>
 #include "AppxPackaging.h"
@@ -35,11 +34,14 @@
 #include "Utils/Error.h"
 #include "Utils/MessageDef.h"
 #include "Utils/File.h"
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 #define MEM_INIT(ARG) memset(&ARG, 0,  sizeof(ARG))
 
 #define ASYNC_APPLY
+
+#define MAX_WIN_GROUPS 64u
 
 typedef struct SWinGroup
 {
@@ -47,7 +49,7 @@ typedef struct SWinGroup
     ATOM _WinClass;
     wchar_t _AppName[MAX_PATH];
     wchar_t _Caption[MAX_PATH];
-    HWND _Windows[64];
+    HWND _Windows[MAX_WIN_GROUPS];
     uint32_t _WindowCount;
     GpBitmap* _IconBitmap;
 } SWinGroup;
@@ -60,7 +62,7 @@ typedef struct SWinArr
 
 typedef struct SWinGroupArr
 {
-    SWinGroup _Data[64];
+    SWinGroup _Data[MAX_WIN_GROUPS];
     uint32_t _Size;
 } SWinGroupArr;
 
@@ -93,9 +95,11 @@ typedef struct Metrics
     uint32_t _WinX;
     uint32_t _WinY;
     float _Container;
-    float _Selection;
     float _Icon;
     float _Pad;
+    float _DigitBoxHeight;
+    float _DigitBoxPad;
+    float _PathThickness;
 } Metrics;
 
 typedef enum Mode
@@ -125,8 +129,10 @@ typedef struct SAppData
     HWND _MainWin;
     HINSTANCE _Instance;
     Mode _Mode;
+    bool _Invert;
     int _Selection;
     int _MouseSelection;
+    bool _CloseHover;
     SGraphicsResources _GraphicsResources;
     SWinGroupArr _WinGroups;
     SWinGroup _CurrentWinGroup;
@@ -149,23 +155,31 @@ static const KeyConfig* _KeyConfig;
 static DWORD _MainThread;
 
 // Main thread
-#define MSG_INIT_WIN (WM_USER + 1)
-#define MSG_INIT_APP (WM_USER + 2)
+#define MSG_INVERT_PUSH (WM_USER + 1)
+#define MSG_INVERT_REL (WM_USER + 2)
 #define MSG_NEXT_WIN (WM_USER + 3)
 #define MSG_NEXT_APP (WM_USER + 4)
-#define MSG_PREV_WIN (WM_USER + 5)
 #define MSG_PREV_APP (WM_USER + 6)
-#define MSG_DEINIT_WIN (WM_USER + 7)
-#define MSG_DEINIT_APP (WM_USER + 8)
+#define MSG_DEINIT (WM_USER + 7)
 #define MSG_CANCEL_APP (WM_USER + 9)
+#define MSG_RESTORE_KEY (WM_USER + 12)
+#define MSG_PREV_WIN (WM_USER + 13)
 
 // Apply thread
 #define MSG_APPLY_APP (WM_USER + 1)
 #define MSG_APPLY_WIN (WM_USER + 2)
 #define MSG_APPLY_APP_MOUSE (WM_USER + 3)
 
+// Main window
+#define MSG_FOCUS (WM_USER + 1)
+#define MSG_REFRESH (WM_USER + 2)
+
 static void RestoreKey(WORD keyCode)
 {
+    // if (GetAsyncKeyState(VK_RCONTROL) & 0x8000)
+    // {
+    //     printf("WHY\n");
+    // }
     {
         INPUT input = {};
         input.type = INPUT_KEYBOARD;
@@ -174,7 +188,11 @@ static void RestoreKey(WORD keyCode)
         const UINT uSent = SendInput(1, &input, sizeof(INPUT));
         ASSERT(uSent == 1);
     }
+
+    usleep(1000);
+
     {
+        // Needed ?
         INPUT input = {};
         input.type = INPUT_KEYBOARD;
         input.ki.wVk = _KeyConfig->_Invert;
@@ -190,7 +208,23 @@ static void RestoreKey(WORD keyCode)
         const UINT uSent = SendInput(1, &input, sizeof(INPUT));
         ASSERT(uSent == 1);
     }
+
+    usleep(1000);
+    if (GetAsyncKeyState(VK_RCONTROL) & 0x8000)
     {
+        // printf("need reset key 0\n");
+        INPUT input = {};
+        input.type = INPUT_KEYBOARD;
+        input.ki.wVk = VK_RCONTROL;
+        input.ki.dwFlags = KEYEVENTF_KEYUP;
+        const UINT uSent = SendInput(1, &input, sizeof(INPUT));
+        ASSERT(uSent == 1);
+    }
+
+    usleep(1000);
+    if (GetKeyState(VK_RCONTROL) & 0x8000)
+    {
+        // printf("need reset key 1\n");
         INPUT input = {};
         input.type = INPUT_KEYBOARD;
         input.ki.wVk = VK_RCONTROL;
@@ -430,7 +464,7 @@ static void FindActualPID(HWND hwnd, DWORD* PID)
         params.InHostWindow = hwnd;
         params.OutPID = 0;
 
-        EnumDesktopWindows(NULL, FindPIDEnumFn, (LPARAM)&params);
+        EnumWindows(FindPIDEnumFn, (LPARAM)&params);
 
         *PID = params.OutPID;
         isUWP = true;
@@ -517,32 +551,32 @@ static bool IsWindowOnMonitor(HWND hwnd, HMONITOR targetMonitor)
     }
 }
 
-static bool IsAltTabWindow(HWND hwnd)
+static bool IsEligibleWindow(HWND hwnd, const SAppData* appData, bool ignoreMinimizedWindows)
 {
-    if (hwnd == GetShellWindow()) //Desktop
+    if (hwnd == GetShellWindow()) // Desktop
         return false;
-
     WINDOWINFO wi = {};
     wi.cbSize = sizeof(WINDOWINFO);
     GetWindowInfo(hwnd, &wi);
     if (!(wi.dwStyle & WS_VISIBLE))
         return false;
     // Chrome has sometime WS_EX_TOOLWINDOW while beeing an alttabable window
-    if ((wi.dwExStyle & WS_EX_TOOLWINDOW) != 0)
+    if ((wi.dwExStyle & WS_EX_TOOLWINDOW))
          return false;
-    if ((wi.dwExStyle & WS_EX_TOPMOST) != 0)
+    if ((wi.dwExStyle & WS_EX_TOPMOST) && !(wi.dwExStyle & WS_EX_APPWINDOW))
         return false;
 
     // Start at the root owner
-    const HWND owner = GetAncestor(hwnd, GA_ROOTOWNER); (void)owner;
-    const HWND parent = GetAncestor(hwnd, GA_PARENT); (void)parent;
-    const HWND dw = GetDesktopWindow(); (void)dw;
+    const HWND owner = GetWindow(hwnd, GW_OWNER); (void)owner;
+    // const HWND parent = GetAncestor(hwnd, GA_PARENT); (void)parent;
+    // const HWND dw = GetDesktopWindow(); (void)dw;
     // Taskbar window if: owner is self or WS_EX_APPWINDOW is set
     bool b = (wi.dwExStyle & WS_EX_APPWINDOW) != 0;(void)(b);
-    if ((owner != hwnd) && !(wi.dwExStyle & WS_EX_APPWINDOW))
+    bool isOwned = owner != hwnd && owner != NULL;
+    if ((isOwned) && !(wi.dwExStyle & WS_EX_APPWINDOW))
         return false;
 
-    if (!BelongsToCurrentDesktop(hwnd))
+    if (appData->_Config._DesktopFilter == DesktopFilterCurrent && !BelongsToCurrentDesktop(hwnd))
         return false;
 
     if (!IsWindowVisible(hwnd))
@@ -560,6 +594,23 @@ static bool IsAltTabWindow(HWND hwnd)
        DwmGetWindowAttribute(hwnd, (DWORD)DWMWA_CLOAKED, (PVOID)&cloaked, (DWORD)sizeof(cloaked));
     if (cloaked)
         return false;
+
+    // Filter apps by monitor if enabled
+    if (appData->_Config._AppFilterMode == AppFilterModeMouseMonitor)
+    {
+        if (!IsWindowOnMonitor(hwnd, appData->_MouseMonitor))
+            return true;
+    }
+
+    if (ignoreMinimizedWindows)
+    {
+        WINDOWPLACEMENT placement;
+        placement.length = sizeof(WINDOWPLACEMENT);
+        GetWindowPlacement(hwnd, &placement);
+        if (placement.showCmd == SW_SHOWMINIMIZED)
+            return false;
+    }
+
     return true;
 }
 
@@ -1000,17 +1051,10 @@ static BOOL IsRunWindow(HWND hwnd)
 
 static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
 {
-    if (!IsAltTabWindow(hwnd))
-        return true;
-
     SAppData* appData = (SAppData*)lParam;
-    
-    // Filter apps by monitor if enabled - moved early to avoid expensive calls
-    if (appData->_Config._AppFilterMode == AppFilterModeMouseMonitor)
-    {
-        if (!IsWindowOnMonitor(hwnd, appData->_MouseMonitor))
-            return true;
-    }
+
+    if (!IsEligibleWindow(hwnd, appData, false))
+        return true;
 
     DWORD PID = 0;
 
@@ -1164,11 +1208,12 @@ static BOOL FillWinGroups(HWND hwnd, LPARAM lParam)
 
 static BOOL FillCurrentWinGroup(HWND hwnd, LPARAM lParam)
 {
-    if (!IsAltTabWindow(hwnd))
+    SAppData* appData = (SAppData*)(lParam);
+    if (!IsEligibleWindow(hwnd, appData, !appData->_Config._RestoreMinimizedWindows))
         return true;
     DWORD PID = 0;
     FindActualPID(hwnd, &PID);
-    SWinGroup* currentWinGroup = (SWinGroup*)(lParam);
+    SWinGroup* currentWinGroup = &appData->_CurrentWinGroup;
     static char moduleFileName[512];
     GetProcessFileName(PID, moduleFileName);
     ATOM winClass = IsRunWindow(hwnd) ? 0x8002 : 0; // Run
@@ -1201,7 +1246,6 @@ static void ComputeMetrics(uint32_t iconCount, float scale, Metrics *metrics, bo
     const int centerX = monitorSize[0] / 2;
     const int screenWidth = monitorSize[0];
     const float containerRatio = 1.25f;
-    const float selectRatio = 1.25f; // Same as container, legacy was different
     float iconSize = GetSystemMetrics(SM_CXICON) * scale;
     const float padRatio = max(0.25 * iconSize, 16.0f) / iconSize; // Keep room for app name
     const uint32_t sizeX = min(iconSize * (iconCount * containerRatio + 2.0f * padRatio), screenWidth * 0.9);
@@ -1215,25 +1259,29 @@ static void ComputeMetrics(uint32_t iconCount, float scale, Metrics *metrics, bo
     metrics->_WinY = sizeY;
     metrics->_Icon = iconSize;
     metrics->_Container = iconSize * containerRatio;
-    metrics->_Selection =  iconSize * selectRatio;
     metrics->_Pad = iconSize * padRatio; 
+    metrics->_DigitBoxHeight = min(max(metrics->_Container * 0.15f, 16.0f), metrics->_Container * 0.5f); // Min size of 16 for text
+    metrics->_PathThickness = 2.0f;
+    metrics->_DigitBoxPad = 0.15 * metrics->_DigitBoxHeight + metrics->_PathThickness;
 }
 
-static const char CLASS_NAME[] = "AltAppSwitcher";
+static const char MAIN_CLASS_NAME[] = "AltAppSwitcher";
 static const char WORKER_CLASS_NAME[] = "AASWorker";
+static const char FOCUS_CLASS_NAME[] = "AASFocus";
 
-static void DestroyWin(HWND win)
+static void DestroyWin(HWND* win)
 {
-    DestroyWindow(win);
-    win = NULL;
+    DestroyWindow(*win);
+    *win = NULL;
 }
 
 static void Draw(SAppData* appData, HDC dc, RECT clientRect);
+static void UIASetFocus(HWND win);
 
 static void CreateWin(SAppData* appData)
 {
     if (appData->_MainWin)
-        DestroyWin(appData->_MainWin);
+        DestroyWin(&appData->_MainWin);
 
     if (appData->_WinGroups._Size == 0)
         return;
@@ -1242,7 +1290,7 @@ static void CreateWin(SAppData* appData)
 
     HWND hwnd = CreateWindowEx(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, // Optional window styles (WS_EX_)
-        CLASS_NAME, // Window class
+        MAIN_CLASS_NAME, // Window class
         "", // Window text
         WS_BORDER | WS_POPUP, // Window style
         // Pos and size
@@ -1280,6 +1328,7 @@ static void CreateWin(SAppData* appData)
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
     //AnimateWindow(hwnd, 1, AW_ACTIVATE | AW_BLEND);
 }
+static void ClearWinGroupArr(SWinGroupArr* winGroups);
 
 static void InitializeSwitchApp(SAppData* appData)
 {
@@ -1304,8 +1353,7 @@ static void InitializeSwitchApp(SAppData* appData)
     {
         appData->_MouseMonitor = NULL; // Explicitly set NULL when not filtering by monitor
     }
-    
-    EnumDesktopWindows(NULL, FillWinGroups, (LPARAM)appData);
+    EnumWindows(FillWinGroups, (LPARAM)appData);
     appData->_Mode = ModeApp;
     appData->_Selection = 0;
     appData->_MouseSelection = 0;
@@ -1317,7 +1365,7 @@ static void InitializeSwitchWin(SAppData* appData)
     HWND win = GetForegroundWindow();
     while (true)
     {
-        if (!win || IsAltTabWindow(win))
+        if (!win || IsEligibleWindow(win, appData, false))
             break;
         win = GetParent(win);
     }
@@ -1330,7 +1378,7 @@ static void InitializeSwitchWin(SAppData* appData)
     pWinGroup->_WinClass = IsRunWindow(win) ? 0x8002 : 0; // Run
     pWinGroup->_WindowCount = 0;
     if (appData->_Config._AppSwitcherMode == AppSwitcherModeApp)
-        EnumDesktopWindows(NULL, FillCurrentWinGroup, (LPARAM)pWinGroup);
+        EnumWindows(FillCurrentWinGroup, (LPARAM)appData);
     else
     {
         pWinGroup->_Windows[0] = win;
@@ -1339,6 +1387,7 @@ static void InitializeSwitchWin(SAppData* appData)
     appData->_Selection = 0;
     appData->_Mode = ModeWin;
 }
+
 static void ClearWinGroupArr(SWinGroupArr* winGroups)
 {
     for (uint32_t i = 0; i < winGroups->_Size; i++)
@@ -1360,23 +1409,31 @@ static void RestoreWin(HWND win)
     if (!IsWindow(win))
         return;
     WINDOWPLACEMENT placement;
-    GetWindowPlacement(win, &placement);
     placement.length = sizeof(WINDOWPLACEMENT);
+    GetWindowPlacement(win, &placement);
     if (placement.showCmd == SW_SHOWMINIMIZED)
     {
-        ShowWindow(win, SW_RESTORE);
-        SetWindowPos(win, HWND_TOP, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+        ShowWindowAsync(win, SW_RESTORE);
+        SetWindowPos(win, HWND_TOP, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER | SWP_ASYNCWINDOWPOS); // Why this call?
     }
 }
 
-static void UIASetFocus(HWND win, IUIAutomation* UIA)
+static void UIASetFocus(HWND win)
 {
+    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    IUIAutomation* UIA = NULL;
+    DWORD res = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&UIA);
+    ASSERT(SUCCEEDED(res))
+
     IUIAutomationElement* el = NULL;
-    DWORD res = IUIAutomation_ElementFromHandle(UIA, win, &el);
+    res = IUIAutomation_ElementFromHandle(UIA, win, &el);
     VERIFY(SUCCEEDED(res));
     res = IUIAutomationElement_SetFocus(el);
     VERIFY(SUCCEEDED(res));
     IUIAutomationElement_Release(el);
+
+    IUIAutomation_Release(UIA);
+    CoUninitialize();
 }
 
 typedef struct ApplySwitchAppData
@@ -1387,7 +1444,7 @@ typedef struct ApplySwitchAppData
 } ApplySwitchAppData;
 
 
-static void ApplySwitchApp(const SWinGroup* winGroup)
+static void ApplySwitchApp(const SWinGroup* winGroup, bool restoreMinimized)
 {
     // Set focus for all win, not only the last one. This way when the active window is closed,
     // the second to last window of the group becomes the active one.
@@ -1399,10 +1456,13 @@ static void ApplySwitchApp(const SWinGroup* winGroup)
 
     int winCount = (int)winGroup->_WindowCount;
 
-    for (int i = winCount - 1; i >= 0 ; i--)
+    if (restoreMinimized)
     {
-        const HWND win = winGroup->_Windows[Modulo(i + 1, winCount)];
-        RestoreWin(win);
+        for (int i = winCount - 1; i >= 0 ; i--)
+        {
+            const HWND win = winGroup->_Windows[Modulo(i + 1, winCount)];
+            RestoreWin(win);
+        }
     }
 
     HWND prev = HWND_TOP;
@@ -1413,9 +1473,6 @@ static void ApplySwitchApp(const SWinGroup* winGroup)
         const HWND win = winGroup->_Windows[Modulo(i + 1, winCount)];
         if (!IsWindow(win))
             continue;
-#if 0
-        UIASetFocus(win, UIA);
-#endif
 
         // This seems more consistent than SetFocus
         // Check if this works with focus when closing multiple win
@@ -1428,8 +1485,12 @@ static void ApplySwitchApp(const SWinGroup* winGroup)
         // ASSERT(dwp != 0);
         prev = win;
     }
-
     ret = EndDeferWindowPos(dwp);
+
+#if 1
+    SetFocus(winGroup->_Windows[0]); 
+#endif
+
     // ASSERT(ret != 0);
 
     for (int i = winCount - 1; i >= 0 ; i--)
@@ -1522,16 +1583,11 @@ static void ApplyWithTimeout(SAppData* appData, unsigned int msg)
 }
 #endif
 
-static void ApplySwitchWin(HWND win)
+static void ApplySwitchWin(HWND win, bool restoreMinimized)
 {
-    RestoreWin(win);
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    IUIAutomation* UIA = NULL;
-    DWORD res = CoCreateInstance(&CLSID_CUIAutomation, NULL, CLSCTX_INPROC_SERVER, &IID_IUIAutomation, (void**)&UIA);
-    ASSERT(SUCCEEDED(res))
-    UIASetFocus(win, UIA);
-    IUIAutomation_Release(UIA);
-    CoUninitialize();
+    if (restoreMinimized)
+        RestoreWin(win);
+    UIASetFocus(win);
 }
 
 static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
@@ -1540,123 +1596,131 @@ static LRESULT KbProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (kbStrut.flags & LLKHF_INJECTED)
         CallNextHookEx(NULL, nCode, wParam, lParam);
 
-    const bool isAppHold = kbStrut.vkCode == _KeyConfig->_AppHold;
-    const bool isAppSwitch = kbStrut.vkCode == _KeyConfig->_AppSwitch;
-    const bool isPrevApp = kbStrut.vkCode == _KeyConfig->_PrevApp;
-    const bool isWinHold = kbStrut.vkCode == _KeyConfig->_WinHold;
-    const bool isWinSwitch = kbStrut.vkCode == _KeyConfig->_WinSwitch;
-    const bool isInvert = kbStrut.vkCode == _KeyConfig->_Invert;
-    const bool isTab = kbStrut.vkCode == VK_TAB;
-    const bool isShift = kbStrut.vkCode == VK_LSHIFT;
-    const bool isEscape = kbStrut.vkCode == VK_ESCAPE;
+    const bool appHoldKey = kbStrut.vkCode == _KeyConfig->_AppHold;
+    const bool nextAppKey = kbStrut.vkCode == _KeyConfig->_AppSwitch;
+    const bool prevAppKey = kbStrut.vkCode == _KeyConfig->_PrevApp;
+    const bool winHoldKey = kbStrut.vkCode == _KeyConfig->_WinHold;
+    const bool nextWinKey = kbStrut.vkCode == _KeyConfig->_WinSwitch;
+    const bool invertKey = kbStrut.vkCode == _KeyConfig->_Invert;
+    const bool tabKey = kbStrut.vkCode == VK_TAB;
+    const bool shiftKey = kbStrut.vkCode == VK_LSHIFT;
+    const bool escKey = kbStrut.vkCode == VK_ESCAPE;
+    // Vim keys: h=left, j=up, k=down, l=right (and arrow keys)
+    const bool vimNextKey = kbStrut.vkCode == 'L' || kbStrut.vkCode == 'J' ||
+                            kbStrut.vkCode == VK_RIGHT || kbStrut.vkCode == VK_DOWN;
+    const bool vimPrevKey = kbStrut.vkCode == 'H' || kbStrut.vkCode == 'K' ||
+                            kbStrut.vkCode == VK_LEFT || kbStrut.vkCode == VK_UP;
     const bool isWatchedKey =
-        isAppHold ||
-        isAppSwitch ||
-        isWinHold ||
-        isWinSwitch ||
-        isInvert ||
-        isTab ||
-        isShift ||
-        (isPrevApp && _KeyConfig->_PrevApp != 0xFFFFFFFF) ||
-        isEscape;
-
+        appHoldKey ||
+        nextAppKey ||
+        prevAppKey ||
+        winHoldKey ||
+        nextWinKey ||
+        invertKey ||
+        tabKey ||
+        shiftKey ||
+        escKey ||
+        vimNextKey ||
+        vimPrevKey;
     if (!isWatchedKey)
         return CallNextHookEx(NULL, nCode, wParam, lParam);
 
-    static KeyState keyState =  { false, false, false };
     static Mode mode = ModeNone;
 
-    const KeyState prevKeyState = keyState;
-
     const bool rel = kbStrut.flags & LLKHF_UP;
-
-    // Update keyState
-    {
-        if (isAppHold)
-            keyState._HoldAppDown = !rel;
-        if (isWinHold)
-            keyState._HoldWinDown = !rel;
-        if (isInvert)
-            keyState._InvertKeyDown = !rel;
-    }
 
     // Update target app state
     bool bypassMsg = false;
     const Mode prevMode = mode;
     {
-        const bool switchWinInput = isWinSwitch && !rel;
-        const bool switchAppInput = isAppSwitch && !rel;
-        const bool prevAppInput = isPrevApp && !rel;
-        const bool winHoldReleasing = prevKeyState._HoldWinDown && !keyState._HoldWinDown;
-        const bool appHoldReleasing = prevKeyState._HoldAppDown && !keyState._HoldAppDown;
-        const bool escapeInput = isEscape && !rel;
-
-        const bool switchApp =
-            switchAppInput &&
-            keyState._HoldAppDown;
-        const bool prevApp =
-            prevAppInput &&
-            keyState._HoldAppDown;
-        const bool switchWin =
-            switchWinInput &&
-            keyState._HoldWinDown;
-        const bool cancel =
-            escapeInput &&
-            keyState._HoldAppDown;
+        const bool prevAppInput = prevAppKey && !rel;
+        const bool escapeInput = escKey && !rel;
+        const bool winHoldRelease = winHoldKey && rel;
+        const bool appHoldRelease = appHoldKey && rel;
+        const bool invertPush = invertKey && !rel;
+        const bool invertRelease = invertKey && rel;
+        const bool nextApp = nextAppKey && !rel;
+        const bool prevApp = prevAppInput && !rel;
+        const bool nextWin = nextWinKey && !rel;
+        const bool cancel = escapeInput;
+        const bool isWinHold = GetAsyncKeyState(_KeyConfig->_WinHold) & 0x8000;
+        const bool isAppHold = GetAsyncKeyState(_KeyConfig->_AppHold) & 0x8000;
+        // Vim/Arrow navigation
+        const bool vimNext = vimNextKey && !rel;
+        const bool vimPrev = vimPrevKey && !rel;
 
         // Denit.
-        if ((prevMode == ModeApp) &&
-            (switchWin || appHoldReleasing) && !prevApp)
+        if (prevMode == ModeApp &&
+            appHoldRelease)
         {
             mode = ModeNone;
+            PostThreadMessage(_MainThread, MSG_DEINIT, 0, 0);
+            PostThreadMessage(_MainThread, MSG_RESTORE_KEY, _KeyConfig->_AppHold, 0);
             bypassMsg = true;
-            PostThreadMessage(_MainThread, MSG_DEINIT_APP, kbStrut.vkCode, 0);
-            RestoreKey(kbStrut.vkCode);
         }
-        else if (prevMode == ModeWin &&
-            (switchApp || winHoldReleasing))
+        else if (prevMode == ModeWin && 
+            winHoldRelease)
         {
-            mode = switchAppInput ? ModeApp : ModeNone;
+            mode = ModeNone;
+            PostThreadMessage(_MainThread, MSG_DEINIT, 0, 0);
+            PostThreadMessage(_MainThread, MSG_RESTORE_KEY, _KeyConfig->_WinHold, 0);
             bypassMsg = true;
-            PostThreadMessage(_MainThread, MSG_DEINIT_WIN, kbStrut.vkCode, 0);
-            RestoreKey(kbStrut.vkCode);
         }
         else if (prevMode == ModeApp && cancel)
         {
             mode = ModeNone;
+            PostThreadMessage(_MainThread, MSG_CANCEL_APP, 0, 0);
+            PostThreadMessage(_MainThread, MSG_RESTORE_KEY, _KeyConfig->_AppHold, 0);
             bypassMsg = true;
-            PostThreadMessage(_MainThread, MSG_CANCEL_APP, kbStrut.vkCode, 0);
-            RestoreKey(kbStrut.vkCode);
         }
 
-        if (mode == ModeNone && switchApp)
+        if (nextApp && isAppHold)
+        {
             mode = ModeApp;
-        else if (mode == ModeNone && switchWin)
-            mode = ModeWin; 
+            PostThreadMessage(_MainThread, MSG_NEXT_APP, 0, 0);
+            bypassMsg = true;
+        }
+        else if (nextWin && isWinHold)
+        {
+            mode = ModeWin;
+            PostThreadMessage(_MainThread, MSG_NEXT_WIN, 0, 0);
+            bypassMsg = true;
+        }
+        else if (invertPush)
+        {
+            PostThreadMessage(_MainThread, MSG_INVERT_PUSH, 0, 0);
+        }
+        else if (invertRelease)
+        {
+            PostThreadMessage(_MainThread, MSG_INVERT_REL, 0, 0);
+        }
 
-        if (mode == ModeApp && prevMode != ModeApp)
+        if (prevApp && isAppHold) // Not *else* if because the key can be shared
         {
+            PostThreadMessage(_MainThread, MSG_PREV_APP, 0, 0);
             bypassMsg = true;
-            PostThreadMessage(_MainThread, MSG_INIT_APP, 0, 0);
-        }
-        else if (mode == ModeWin && prevMode != ModeWin)
-        {
-            bypassMsg = true;
-            PostThreadMessage(_MainThread, MSG_INIT_WIN, 0, 0);
         }
 
-        if (mode == ModeApp)
+        // Vim/Arrow key navigation (h/left/k/up = prev, l/right/j/down = next)
+        if (vimNext && prevMode == ModeApp)
         {
+            PostThreadMessage(_MainThread, MSG_NEXT_APP, 0, 0);
             bypassMsg = true;
-            if (switchApp)
-                PostThreadMessage(_MainThread, keyState._InvertKeyDown ? MSG_PREV_APP : MSG_NEXT_APP, 0, 0);
-            else if (prevApp)
-                PostThreadMessage(_MainThread, MSG_PREV_APP, 0, 0);
         }
-        else if (switchWin)
+        else if (vimPrev && prevMode == ModeApp)
         {
+            PostThreadMessage(_MainThread, MSG_PREV_APP, 0, 0);
             bypassMsg = true;
-            PostThreadMessage(_MainThread, keyState._InvertKeyDown ? MSG_PREV_WIN : MSG_NEXT_WIN, 0, 0);
+        }
+        else if (vimNext && prevMode == ModeWin)
+        {
+            PostThreadMessage(_MainThread, MSG_NEXT_WIN, 0, 0);
+            bypassMsg = true;
+        }
+        else if (vimPrev && prevMode == ModeWin)
+        {
+            PostThreadMessage(_MainThread, MSG_PREV_WIN, 0, 0);
+            bypassMsg = true;
         }
     }
 
@@ -1694,6 +1758,21 @@ static bool IsInside(int x, int y, HWND win)
     return x > r.left && x < r.right && y > r.top && y < r.bottom;
 }
 
+static void CloseButtonRect(float* outRect, const Metrics* m, uint32_t idx)
+{
+    const float w = m->_DigitBoxHeight;
+    const float p = m->_DigitBoxPad;
+    RectF r = {
+            m->_Pad + m->_Container * (idx + 1) - w - p,
+            m->_Pad + p,
+            w,
+            w };
+    outRect[0] = r.X;
+    outRect[1] = r.Y;
+    outRect[2] = r.X + r.Width;
+    outRect[3] = r.Y + r.Height;
+}
+
 static void Draw(SAppData* appData, HDC dc, RECT clientRect)
 {
     HWND hwnd = appData->_MainWin;
@@ -1713,24 +1792,20 @@ static void Draw(SAppData* appData, HDC dc, RECT clientRect)
     ASSERT(Ok == GdipCreateFromHDC(pGraphRes->_DC, &pGraphics));
     // gdiplus/gdiplusenums.h
     GdipSetSmoothingMode(pGraphics, SmoothingModeAntiAlias);
-    GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeNone);
+    GdipSetPixelOffsetMode(pGraphics, PixelOffsetModeHighQuality);
     GdipSetInterpolationMode(pGraphics, InterpolationModeHighQualityBilinear); // InterpolationModeHighQualityBicubic
     GdipSetTextRenderingHint(pGraphics, TextRenderingHintClearTypeGridFit);
 
     const float containerSize = appData->_Metrics._Container;
     const float iconSize = appData->_Metrics._Icon;
-    const float selectSize = appData->_Metrics._Selection;
+    const float selectSize = containerSize;
     const float pad = appData->_Metrics._Pad;
     const float padSelect = (containerSize - selectSize) * 0.5f;
     const float padIcon = (containerSize - iconSize) * 0.5f;
-    const float digitBoxHeight = min(max(selectSize * 0.15f, 16.0f), selectSize * 0.5f);
-    const float digitBoxPad = digitBoxHeight * 0.15f;
-    const float digitHeight = digitBoxHeight * 0.75f;
-    const float digitPad = digitBoxHeight * 0.1f; (void)digitPad; // Implicit as text centering is handled by gdip
+    const float digitHeight = appData->_Metrics._DigitBoxHeight * 0.75f;
     const float nameHeight = pad * 0.6f;
     const float namePad = pad * 0.2f;
-    const float pathThickness = 2.0f;
-
+ 
     float x = pad;
     float y = pad;
 
@@ -1743,8 +1818,6 @@ static void Draw(SAppData* appData, HDC dc, RECT clientRect)
         ASSERT(Ok == GdipCreateFontFamilyFromName(L"Segoe UI", fc, &pFontFamily));
         ASSERT(Ok == GdipCreateFont(pFontFamily, nameHeight, FontStyleRegular, (int)MetafileFrameUnitPixel, &fontName));
     }
-
-
 
     // Selection box
     {
@@ -1779,7 +1852,23 @@ static void Draw(SAppData* appData, HDC dc, RECT clientRect)
         // Also check palette to see if monochrome
         if (pWinGroup->_IconBitmap)
         {
-            GdipDrawImageRectI(pGraphics, pWinGroup->_IconBitmap, x + padIcon, y + padIcon, iconSize, iconSize);
+            unsigned int bitmapWidth; 
+            GdipGetImageWidth(pWinGroup->_IconBitmap, &bitmapWidth);
+            // If very low res, use nearest neighbor upscale
+            if (bitmapWidth < 64)
+            {
+                InterpolationMode backupInterpMode = InterpolationModeInvalid;
+                GdipGetInterpolationMode(pGraphics, &backupInterpMode);
+                GdipSetInterpolationMode(pGraphics, InterpolationModeNearestNeighbor); // InterpolationModeHighQualityBicubic
+                // Ensure draw size is a multiple of bitmap size so upscaled pixel size is constant.
+                unsigned int ratio = iconSize / bitmapWidth;
+                unsigned int targetIconSize = ratio * bitmapWidth;
+                float extraPad = (float)(iconSize - targetIconSize) / 2.0f;
+                GdipDrawImageRectI(pGraphics, pWinGroup->_IconBitmap, x + padIcon + extraPad, y + padIcon + extraPad, targetIconSize, targetIconSize);
+                GdipSetInterpolationMode(pGraphics, backupInterpMode);
+            }
+            else
+                GdipDrawImageRectI(pGraphics, pWinGroup->_IconBitmap, x + padIcon, y + padIcon, iconSize, iconSize);
         }
 
         // Digit
@@ -1788,9 +1877,9 @@ static void Draw(SAppData* appData, HDC dc, RECT clientRect)
             WCHAR str[] = L"\0\0";
             const uint32_t winCount = min(pWinGroup->_WindowCount, 99);
             const uint32_t digitsCount = winCount > 9 ? 2 : 1;
-            const float w = digitBoxHeight;
-            const float h = digitBoxHeight;
-            const float p = digitBoxPad + pathThickness;
+            const float w = appData->_Metrics._DigitBoxHeight;
+            const float h = appData->_Metrics._DigitBoxHeight;
+            const float p = appData->_Metrics._DigitBoxPad;
             RectF r = {
                 (x + padSelect + selectSize - p - w),
                 (y + padSelect + selectSize - p - h),
@@ -1860,6 +1949,48 @@ static void Draw(SAppData* appData, HDC dc, RECT clientRect)
 
         x += containerSize;
     }
+
+    // Close button
+    {
+        const uint32_t mouseSelIdx = (uint32_t)appData->_MouseSelection;
+        float r0[4];
+        CloseButtonRect(r0, &appData->_Metrics, mouseSelIdx);
+        const float w0 = r0[2] - r0[0];
+        const float w1 = w0 * 0.5;
+        float r1[4];
+        r1[0] = r0[0] + w1 * 0.5;
+        r1[1] = r0[1] + w1 * 0.5;
+        r1[2] = r0[2] - w1 * 0.5;
+        r1[3] = r0[3] - w1 * 0.5;
+        r1[0] = round(r1[0]);
+        r1[1] = round(r1[1]);
+        r1[2] = round(r1[2]);
+        r1[3] = round(r1[3]);
+        if (appData->_CloseHover)
+        {
+            RectF _r0 = { r0[0], r0[1], w0, w0 };
+            _r0.X = round(_r0.X);
+            _r0.Y = round(_r0.Y);
+            _r0.Width = round(_r0.Width);
+            _r0.Height = round(_r0.Height);
+            DrawRoundedRect(pGraphics, NULL, pGraphRes->_pBrushText, &_r0, 5);
+
+            GpPen* pPen;
+            GdipCreatePen2(pGraphRes->_pBrushBg, 2, UnitPixel, &pPen);
+            GdipDrawLineI(pGraphics, pPen, r1[0], r1[1], r1[2], r1[3]);
+            GdipDrawLineI(pGraphics, pPen, r1[2], r1[1], r1[0], r1[3]);
+            GdipDeletePen(pPen);
+        }
+        else
+        {
+            GpPen* pPen;
+            GdipCreatePen2(pGraphRes->_pBrushText, 2, UnitPixel, &pPen);
+            GdipDrawLineI(pGraphics, pPen, r1[0], r1[1], r1[2], r1[3]);
+            GdipDrawLineI(pGraphics, pPen, r1[2], r1[1], r1[0], r1[3]);
+            GdipDeletePen(pPen);
+        }
+    }
+
     BitBlt(GetDC(hwnd), clientRect.left, clientRect.top, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, pGraphRes->_DC, 0, 0, SRCCOPY);
 
     // Always restore old bitmap (see fn doc)
@@ -1884,19 +2015,19 @@ LRESULT CALLBACK WorkerWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
     }
     case MSG_APPLY_APP:
     {
-        ApplySwitchApp(&appData->_WinGroups._Data[appData->_Selection]);
+        ApplySwitchApp(&appData->_WinGroups._Data[appData->_Selection], appData->_Config._RestoreMinimizedWindows);
         PostQuitMessage(0);
         return 0;
     }
     case MSG_APPLY_WIN:
     {
-        ApplySwitchWin(appData->_CurrentWinGroup._Windows[appData->_Selection]);
+        ApplySwitchWin(appData->_CurrentWinGroup._Windows[appData->_Selection], appData->_Config._RestoreMinimizedWindows);
         PostQuitMessage(0);
         return 0;
     }
     case MSG_APPLY_APP_MOUSE:
     {
-        ApplySwitchApp(&appData->_WinGroups._Data[appData->_MouseSelection]);
+        ApplySwitchApp(&appData->_WinGroups._Data[appData->_MouseSelection], appData->_Config._RestoreMinimizedWindows);
         PostQuitMessage(0);
         return 0;
     }
@@ -1904,9 +2035,46 @@ LRESULT CALLBACK WorkerWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lP
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+LRESULT FocusWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+    switch (uMsg)
+    {
+    case WM_DESTROY:
+    case WM_CREATE:
+    case WM_PAINT:
+    case WM_SIZE:
+    case WM_SETFOCUS:
+        break;
+    }
+    return DefWindowProc(hwnd, uMsg, wParam, lParam); 
+}
+
+typedef struct CloseThreadData
+{
+    HWND Win[MAX_WIN_GROUPS];
+    uint32_t Count;
+    HWND MainWin;
+} CloseThreadData;
+
+static DWORD CloseThread(LPVOID data)
+{
+    const CloseThreadData* d = (const CloseThreadData*)data;
+    for (int i =  0; i < d->Count; i++)
+    {
+        const HWND win = d->Win[i];
+        while (IsWindow(win))
+        {
+            usleep(1000);
+        }
+    }
+    PostMessage(d->MainWin, MSG_REFRESH, 0, 0);
+    return 0;
+}
+
+LRESULT CALLBACK MainWindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
     static SAppData* appData = NULL;
+    static HWND focusWindows[MAX_WIN_GROUPS];
     switch (uMsg)
     {
     case WM_MOUSEMOVE:
@@ -1915,8 +2083,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             return 0;
         const int iconContainerSize = (int)appData->_Metrics._Container;
         const int pad = (int)appData->_Metrics._Pad;
-        const int posX = GET_X_LPARAM(lParam);
-        appData->_MouseSelection = min(max(0, (posX - pad) / iconContainerSize), (int)appData->_WinGroups._Size - 1);
+        const int x = GET_X_LPARAM(lParam);
+        const int y = GET_Y_LPARAM(lParam);
+        appData->_MouseSelection = min(max(0, (x - pad) / iconContainerSize), (int)appData->_WinGroups._Size - 1);
+        float r[4];
+        CloseButtonRect(r, &appData->_Metrics, appData->_MouseSelection);
+        appData->_CloseHover = x < r[2] && x > r[0] && y > r[1] && y < r[3];
         InvalidateRect(appData->_MainWin, 0, FALSE);
         UpdateWindow(appData->_MainWin);
         return 0;
@@ -1940,8 +2112,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
             ReleaseDC(hwnd, winDC);
         }
         SetCapture(hwnd);
-        // Otherwise cursor is busy on hover. I Don't understand why.
+        // Otherwise cursor is busy on hover. I don't understand why.
         SetCursor(LoadCursor(NULL, IDC_ARROW));
+
+        for (int i = 0; i < appData->_WinGroups._Size; i++)
+        {
+            const int iconContainerSize = (int)appData->_Metrics._Container;
+            const int pad = (int)appData->_Metrics._Pad;
+            int x = pad + i * (iconContainerSize);
+            focusWindows[i] = CreateWindowEx(0, FOCUS_CLASS_NAME, NULL,
+                WS_CHILD /* | WS_VISIBLE */,
+                x, pad, iconContainerSize, iconContainerSize,
+                hwnd, NULL, appData->_Instance, NULL);
+        }
+
+        return 0;
+    }
+    case MSG_FOCUS:
+    {
+        // uia set focus here gives inconsistent app behavior IDK why.
+        // UIASetFocus(focusWindows[appData->_Selection]);
+        SetFocus(focusWindows[appData->_Selection]);
+        return 0;
+    }
+    case MSG_REFRESH:
+    {
+        ClearWinGroupArr(&appData->_WinGroups);
+        InitializeSwitchApp(appData);
+        return 0;
+    }
+    {
+        // uia set focus here gives inconsistent app behavior IDK why.
+        // UIASetFocus(focusWindows[appData->_Selection]);
+        SetFocus(focusWindows[appData->_Selection]);
         return 0;
     }
     case WM_LBUTTONUP:
@@ -1949,12 +2152,41 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         if (!IsInside(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), hwnd))
         {
             appData->_Mode = ModeNone;
-            DestroyWin(appData->_MainWin);
+            DestroyWin(&appData->_MainWin);
             ClearWinGroupArr(&appData->_WinGroups);
             return 0;
         }
         if (!appData->_Config._Mouse)
             return 0;
+
+        if (appData->_CloseHover)
+        {
+            static HANDLE ht = 0;
+            static CloseThreadData ctd = {};
+            if (ht)
+                TerminateThread(ht, 0);
+            ctd.Count = 0;
+
+            ctd.MainWin = hwnd;
+            const SWinGroup* winGroup = &appData->_WinGroups._Data[appData->_MouseSelection];
+            for (int i =  0; i < winGroup->_WindowCount; i++)
+            {
+                const HWND win = winGroup->_Windows[i];
+                ctd.Count++;
+                ctd.Win[i] = win;
+            }
+
+            DWORD tid;
+            ht = CreateThread(NULL, 0, CloseThread, (void*)&ctd, 0, &tid);
+
+            for (int i =  0; i < winGroup->_WindowCount; i++)
+            {
+                const HWND win = winGroup->_Windows[i];
+                PostMessage(win, WM_CLOSE, 0, 0);
+            }
+
+            return 0;
+        }
 #ifdef ASYNC_APPLY
         ApplyWithTimeout(appData, MSG_APPLY_APP_MOUSE);
 #else
@@ -1963,12 +2195,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
         appData->_Mode = ModeNone;
         appData->_Selection = 0;
         appData->_MouseSelection = 0;
-        DestroyWin(appData->_MainWin);
+        appData->_CloseHover = false;
+        DestroyWin(&appData->_MainWin);
         ClearWinGroupArr(&appData->_WinGroups);
         return 0;
     }
     case WM_DESTROY:
     {
+        // Free hooks
+        // {
+        //     for (uint32_t i = 0; i < g_CloseHookCount; i++)
+        //     {
+        //         ASSERT(g_CloseHook[i]);
+        //         UnhookWinEvent(g_CloseHook[i]);
+        //         g_CloseHook[i] = 0;
+        //     }
+        //     g_CloseHookCount = 0;
+        //     g_MainWinForCloseHook = 0;
+        // }
         DeleteDC(appData->_GraphicsResources._DC);
         DeleteObject(appData->_GraphicsResources._Bitmap);
         return 0;
@@ -2006,6 +2250,40 @@ static DWORD KbHookCb(LPVOID param)
     return (DWORD)0;
 }
 
+#if 0
+static BOOL GetFirstWindow(HWND win, LPARAM lParam)
+{
+    *(HWND*)lParam = win;
+    return false;
+}
+
+static HWND GetFirstChild(HWND win)
+{
+    HWND child = NULL;
+    EnumChildWindows(win, GetFirstWindow, (LPARAM)&child);
+    return child;
+}
+#endif
+
+static void DeinitApp(SAppData* appData)
+{
+#ifdef ASYNC_APPLY
+    ApplyWithTimeout(appData, MSG_APPLY_APP);
+#else
+    ApplySwitchApp(&appData->_WinGroups._Data[appData->_Selection]);
+#endif
+    appData->_Mode = ModeNone;
+    appData->_Selection = 0;
+    DestroyWin(&appData->_MainWin);
+    ClearWinGroupArr(&appData->_WinGroups);
+}
+
+static void DeinitWin(SAppData* appData)
+{
+    appData->_Mode = ModeNone;
+    appData->_Selection = 0;
+}
+
 int StartAltAppSwitcher(HINSTANCE hInstance)
 {
     SetLastError(0);
@@ -2024,9 +2302,9 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
 
     {
         WNDCLASS wc = { };
-        wc.lpfnWndProc   = WindowProc;
+        wc.lpfnWndProc   = MainWindowProc;
         wc.hInstance     = hInstance;
-        wc.lpszClassName = CLASS_NAME;
+        wc.lpszClassName = MAIN_CLASS_NAME;
         wc.cbWndExtra = sizeof(SAppData*);
         wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
@@ -2045,8 +2323,20 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
     }
 
     {
+        WNDCLASS wc = { };
+        wc.lpfnWndProc   = DefWindowProc;
+        wc.hInstance     = hInstance;
+        wc.lpszClassName = FOCUS_CLASS_NAME;
+        wc.cbWndExtra = 0;
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.hbrBackground = GetSysColorBrush(COLOR_HIGHLIGHT);
+        RegisterClass(&wc);
+    }
+
+    {
         _AppData._Mode = ModeNone;
         _AppData._Selection = 0;
+        _AppData._Invert = false;
         _AppData._MainWin = NULL;
         _AppData._Instance = hInstance;
         _AppData._WinGroups._Size = 0;
@@ -2055,20 +2345,6 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
         _MainThread = GetCurrentThreadId();
         _KeyConfig = &_AppData._Config._Key;
         // Init. and loads config
-        _AppData._Config._Key._AppHold = VK_LMENU;
-        _AppData._Config._Key._AppSwitch = VK_TAB;
-        _AppData._Config._Key._WinHold = VK_LMENU;
-        _AppData._Config._Key._WinSwitch = VK_OEM_3;
-        _AppData._Config._Key._Invert = VK_LSHIFT;
-        _AppData._Config._Key._PrevApp = 0xFFFFFFFF;
-        _AppData._Config._Mouse = true;
-        _AppData._Config._CheckForUpdates = true;
-        _AppData._Config._ThemeMode = ThemeModeAuto;
-        _AppData._Config._AppSwitcherMode = AppSwitcherModeApp;
-        _AppData._Config._Scale = 1.75;
-        _AppData._Config._DisplayName = DisplayNameSel;
-        _AppData._Config._MultipleMonitorMode = MultipleMonitorModeMouse;
-        _AppData._Config._AppFilterMode = AppFilterModeAll;
         LoadConfig(&_AppData._Config);
         InitializeCriticalSection(&_AppData._WorkerCS);
         _AppData._MouseMonitor = NULL;
@@ -2134,95 +2410,75 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
     {
         switch (msg.message)
         {
-        case MSG_INIT_APP:
-        {
-            InitializeSwitchApp(&_AppData);
-            break;
-        }
-        case MSG_INIT_WIN:
-        {
-            InitializeSwitchWin(&_AppData);
-            break;
-        }
         case MSG_NEXT_APP:
         {
+            if (_AppData._Mode == ModeWin)
+                DeinitWin(&_AppData);
             if (_AppData._Mode == ModeNone)
                 InitializeSwitchApp(&_AppData);
-            _AppData._Selection++;
+            _AppData._Selection += _AppData._Invert ? -1 : 1;
             _AppData._Selection = Modulo(_AppData._Selection, _AppData._WinGroups._Size);
             InvalidateRect(_AppData._MainWin, 0, FALSE);
             UpdateWindow(_AppData._MainWin);
+            SendNotifyMessage(_AppData._MainWin, MSG_FOCUS, 0,0 );
             break;
         }
         case MSG_PREV_APP:
         {
-            if (_AppData._Mode == ModeNone)
-                InitializeSwitchApp(&_AppData);
-            _AppData._Selection--;
+            // Prev app does not have the ability to init the mode
+            if (_AppData._Mode != ModeApp)
+                break;
+            _AppData._Selection += _AppData._Invert ? 1 : -1;
             _AppData._Selection = Modulo(_AppData._Selection, _AppData._WinGroups._Size);
             InvalidateRect(_AppData._MainWin, 0, FALSE);
             UpdateWindow(_AppData._MainWin);
+            SendNotifyMessage(_AppData._MainWin, MSG_FOCUS, 0,0 );
             break;
         }
         case MSG_NEXT_WIN:
         {
+            if (_AppData._Mode == ModeApp)
+                break;
             if (_AppData._Mode == ModeNone)
                 InitializeSwitchWin(&_AppData);
-            _AppData._Selection++;
+            _AppData._Selection += _AppData._Invert ? -1 : 1;
             _AppData._Selection = Modulo(_AppData._Selection, _AppData._CurrentWinGroup._WindowCount);
-
 #ifdef ASYNC_APPLY
             ApplyWithTimeout(&_AppData, MSG_APPLY_WIN);
 #else
             HWND win = _AppData._CurrentWinGroup._Windows[_AppData._Selection];
-            ApplySwitchWin(win);
+            ApplySwitchWin(win, appData->_Config._RestoreMinimizedWindows);
 #endif
-
             break;
         }
         case MSG_PREV_WIN:
         {
-            if (_AppData._Mode == ModeNone)
-                InitializeSwitchWin(&_AppData);
-            _AppData._Selection--;
+            // Prev win does not have the ability to init the mode
+            if (_AppData._Mode != ModeWin)
+                break;
+            _AppData._Selection += _AppData._Invert ? 1 : -1;
             _AppData._Selection = Modulo(_AppData._Selection, _AppData._CurrentWinGroup._WindowCount);
-
 #ifdef ASYNC_APPLY
             ApplyWithTimeout(&_AppData, MSG_APPLY_WIN);
 #else
             HWND win = _AppData._CurrentWinGroup._Windows[_AppData._Selection];
-            ApplySwitchWin(win);
+            ApplySwitchWin(win, appData->_Config._RestoreMinimizedWindows);
 #endif
             break;
         }
-        case MSG_DEINIT_APP:
+        case MSG_DEINIT:
         {
-            if (_AppData._Mode == ModeNone)
-                break;
-#ifdef ASYNC_APPLY
-            ApplyWithTimeout(&_AppData, MSG_APPLY_APP);
-#else
-            ApplySwitchApp(&_AppData._WinGroups._Data[_AppData._Selection]);
-#endif
-            _AppData._Mode = ModeNone;
-            _AppData._Selection = 0;
-            DestroyWin(_AppData._MainWin);
-            ClearWinGroupArr(&_AppData._WinGroups);
+            if (_AppData._Mode == ModeApp)
+                DeinitApp(&_AppData);
+            else if (_AppData._Mode == ModeWin)
+                DeinitWin(&_AppData);
             break;
         }
         case MSG_CANCEL_APP:
         {
             _AppData._Mode = ModeNone;
-            DestroyWin(_AppData._MainWin);
+            DestroyWin(&_AppData._MainWin);
             ClearWinGroupArr(&_AppData._WinGroups);
-            break;
-        }
-        case MSG_DEINIT_WIN:
-        {
-            if (_AppData._Mode == ModeNone)
-                break;
-            _AppData._Mode = ModeNone;
-            _AppData._Selection = 0;
             break;
         }
         case MSG_RESTART_AAS:
@@ -2233,6 +2489,21 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
         case MSG_CLOSE_AAS:
         {
             closeAAS = true;
+            break;
+        }
+        case MSG_INVERT_PUSH:
+        {
+            _AppData._Invert = true;
+            break;
+        }
+        case MSG_INVERT_REL:
+        {
+            _AppData._Invert = false;
+            break;
+        }
+        case MSG_RESTORE_KEY:
+        {
+            RestoreKey(msg.wParam);
             break;
         }
         }
@@ -2247,7 +2518,8 @@ int StartAltAppSwitcher(HINSTANCE hInstance)
     }
 
     GdiplusShutdown(gdiplusToken);
-    UnregisterClass(CLASS_NAME, hInstance);
+    UnregisterClass(MAIN_CLASS_NAME, hInstance);
+    UnregisterClass(WORKER_CLASS_NAME, hInstance);
 
     if (restartAAS)
     {
